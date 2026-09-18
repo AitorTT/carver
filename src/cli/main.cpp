@@ -35,7 +35,7 @@ void printUsage() {
         "  --probe <input>   hex dump raw bytes, to check that a device reads correctly\n"
         "        [--offset <bytes>] [--length <bytes>]\n"
         "  --image <input> <destination>   write a byte-for-byte copy and SHA-256 hash\n"
-        "        [--start <bytes>] [--end <bytes>]\n"
+        "        [--start <bytes>] [--end <bytes>] [--resume] [--force]\n"
         "  --partitions <input>   list the partitions on a disk or image\n"
         "  --partition <n>        use partition n as the NTFS volume (default: auto)\n"
         "\n"
@@ -129,6 +129,10 @@ int main(int argc, char** argv) {
                 imageOptions.endOffset = std::strtoull(args[++index].c_str(), nullptr, 0);
             } else if (args[index] == "--chunk" && index + 1 < args.size()) {
                 imageOptions.chunkSize = std::strtoull(args[++index].c_str(), nullptr, 0);
+            } else if (args[index] == "--resume") {
+                imageOptions.resume = true;
+            } else if (args[index] == "--force") {
+                imageOptions.force = true;
             } else if (sourcePath.empty()) {
                 sourcePath = args[index];
             } else if (destinationPath.empty()) {
@@ -178,11 +182,23 @@ int main(int argc, char** argv) {
             return 1;
         }
 
+        uint64_t alreadyDone = 0;
+        if (imageOptions.resume) {
+            std::string resumeError;
+            if (!carver::imageResumeOffset(destinationPath, sourcePath, begin, finish, alreadyDone, resumeError)) {
+                std::cerr << "error: cannot resume: " << resumeError << "\n";
+                return 1;
+            }
+            imageOptions.startOffset = begin;
+            imageOptions.endOffset = finish;
+        }
+
         uint64_t freeBytes = 0;
         uint64_t totalBytes = 0;
-        if (carver::volumeFreeSpace(destinationMount, freeBytes, totalBytes) && freeBytes < imageBytes) {
-            std::cerr << "error: not enough space on " << destinationMount << " for a "
-                      << humanBytes(imageBytes) << " image (" << humanBytes(freeBytes) << " free)\n";
+        const uint64_t stillNeeded = imageBytes - alreadyDone;
+        if (carver::volumeFreeSpace(destinationMount, freeBytes, totalBytes) && freeBytes < stillNeeded) {
+            std::cerr << "error: not enough space on " << destinationMount << " for the remaining "
+                      << humanBytes(stillNeeded) << " (" << humanBytes(freeBytes) << " free)\n";
             return 1;
         }
 
@@ -191,9 +207,19 @@ int main(int argc, char** argv) {
         std::cout << "sector : " << device.sectorSize() << " bytes\n";
         std::cout << "range  : " << begin << " .. " << finish << "  (" << humanBytes(imageBytes) << ")\n";
         std::cout << "dest   : " << destinationPath << "\n";
-        std::cout << "free   : " << humanBytes(freeBytes) << " on " << destinationMount << "\n\n";
+        std::cout << "free   : " << humanBytes(freeBytes) << " on " << destinationMount << "\n";
+        if (alreadyDone > 0) {
+            std::cout << "resume : continuing from " << humanBytes(alreadyDone) << " ("
+                      << humanBytes(stillNeeded) << " left)\n";
+        }
+        std::cout << "\n";
 
         const auto imageProgress = [imageBytes](const carver::ImageProgress& state) {
+            static const uint64_t stopAfter = [] {
+                const char* value = std::getenv("CARVER_IMAGE_STOP_AFTER");
+                return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull;
+            }();
+
             const double percent = state.bytesTotal == 0
                                         ? 100.0
                                         : (static_cast<double>(state.bytesDone) /
@@ -207,21 +233,35 @@ int main(int argc, char** argv) {
                         state.bytesPerSecond / (1024.0 * 1024.0),
                         humanBytes(static_cast<uint64_t>(remaining)).c_str());
             std::fflush(stdout);
+
+            if (stopAfter > 0 && state.bytesDone >= stopAfter) {
+                return false;
+            }
             return true;
         };
 
         carver::ImageResult imageResult;
-        const bool imaged = carver::createImage(device, destinationPath, imageOptions,
+        const bool imaged = carver::createImage(device, sourcePath, destinationPath, imageOptions,
                                                 imageProgress, imageResult, error);
         std::printf("\n\n");
 
         if (!imaged) {
             std::cerr << "error: " << (error.empty() ? "imaging cancelled" : error) << "\n";
+            if (imageResult.bytesWritten > 0) {
+                std::cout << "partial image kept: " << humanBytes(imageResult.bytesWritten)
+                          << " written\n";
+                std::cout << "resume with    : carver-cli --image \"" << sourcePath << "\" \""
+                          << destinationPath << "\" --resume\n";
+            }
             return 1;
         }
 
         std::cout << "bytes written : " << imageResult.bytesWritten << " ("
-                  << humanBytes(imageResult.bytesWritten) << ")\n";
+                  << humanBytes(imageResult.bytesWritten) << ")";
+        if (imageResult.resumed) {
+            std::cout << ", " << humanBytes(imageResult.bytesThisRun) << " this run";
+        }
+        std::cout << "\n";
         std::cout << "sha256        : " << imageResult.sha256 << "\n";
         std::cout << "\nverify with   : certutil -hashfile \"" << destinationPath << "\" SHA256\n";
         return 0;
