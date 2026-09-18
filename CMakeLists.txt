@@ -19,6 +19,7 @@ add_library(carver_core STATIC
   src/core/device.cpp
   src/core/device_enum.cpp
   src/core/ntfs.cpp
+  src/core/recover.cpp
   src/core/signature.cpp
   src/core/carver.cpp
 )

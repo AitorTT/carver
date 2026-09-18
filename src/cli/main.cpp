@@ -2,6 +2,7 @@
 #include "core/device.h"
 #include "core/device_enum.h"
 #include "core/ntfs.h"
+#include "core/recover.h"
 #include "core/signature.h"
 
 #include <cstdio>
@@ -26,6 +27,8 @@ void printUsage() {
         "  --chunk <bytes>   read chunk size (default 8 MiB)\n"
         "  --free-only       scan only unallocated NTFS clusters, using $Bitmap\n"
         "                    (input must be an NTFS volume, e.g. \\\\.\\D:)\n"
+        "  --mft-recover     recover deleted files by name from deleted $MFT records\n"
+        "                    (input must be an NTFS volume)\n"
         "\n"
         "input is a disk image file, or a raw device such as\n"
         "\\\\.\\PhysicalDrive2 which requires an elevated shell.\n";
@@ -91,11 +94,16 @@ int main(int argc, char** argv) {
 
     carver::CarveOptions options;
     bool freeOnly = false;
+    bool mftRecover = false;
 
     for (size_t index = 2; index < args.size(); ++index) {
         const std::string& flag = args[index];
         if (flag == "--free-only") {
             freeOnly = true;
+            continue;
+        }
+        if (flag == "--mft-recover") {
+            mftRecover = true;
             continue;
         }
         if (index + 1 >= args.size()) {
@@ -125,8 +133,9 @@ int main(int argc, char** argv) {
     }
 
     carver::NtfsVolumeInfo volume;
+    std::vector<uint8_t> bitmap;
 
-    if (freeOnly) {
+    if (freeOnly || mftRecover) {
         std::vector<uint8_t> bootSector(512, 0);
         uint32_t got = 0;
         if (!device.readAt(0, bootSector.data(), static_cast<uint32_t>(bootSector.size()), got, error) || got < 512) {
@@ -137,13 +146,66 @@ int main(int argc, char** argv) {
             std::cerr << "error: input is not an NTFS volume: " << error << "\n";
             return 1;
         }
-
-        std::vector<uint8_t> bitmap;
         if (!carver::readBitmap(device, volume, bitmap, error)) {
             std::cerr << "error: cannot read $Bitmap: " << error << "\n";
             return 1;
         }
 
+        std::cout << "filesystem : NTFS, " << volume.bytesPerCluster << " byte clusters\n";
+        std::cout << "clusters   : " << volume.totalClusters() << "\n";
+        std::cout << "bitmap     : " << bitmap.size() << " bytes\n";
+    }
+
+    if (mftRecover) {
+        uint64_t recordCount = 0;
+        if (!carver::getMftRecordCount(device, volume, recordCount, error)) {
+            std::cerr << "error: " << error << "\n";
+            return 1;
+        }
+
+        std::cout << "mft records: " << recordCount << "\n";
+        std::cout << "output     : " << outputDirectory << "\n\n";
+
+        const auto recoverProgress = [](const carver::Progress& state) {
+            const double percent = state.bytesTotal == 0
+                                        ? 100.0
+                                        : (static_cast<double>(state.bytesScanned) /
+                                           static_cast<double>(state.bytesTotal)) * 100.0;
+            std::printf("\r[%5.1f%%] record %llu  %4llu files  %10s written  %-24s",
+                        percent,
+                        static_cast<unsigned long long>(state.bytesScanned),
+                        static_cast<unsigned long long>(state.filesRecovered),
+                        humanBytes(state.bytesRecovered).c_str(),
+                        state.currentOutput.c_str());
+            std::fflush(stdout);
+            return true;
+        };
+
+        carver::RecoverOptions recoverOptions;
+        std::vector<carver::RecoveredFile> index;
+
+        const carver::RecoverResult recovered = carver::recoverDeletedFiles(
+            device, volume, bitmap, outputDirectory, recoverOptions, recoverProgress, index, error);
+
+        std::printf("\n\n");
+
+        if (!error.empty()) {
+            std::cerr << "error: " << error << "\n";
+        }
+
+        std::cout << "records scanned : " << recovered.recordsScanned << "\n";
+        std::cout << "deleted entries : " << recovered.deletedFound << "\n";
+        std::cout << "files written   : " << recovered.filesWritten << "\n";
+        std::cout << "bytes written   : " << humanBytes(recovered.bytesWritten) << "\n";
+        std::cout << "possibly overwritten : " << recovered.atRisk << "\n";
+        std::cout << "index           : " << outputDirectory << "\\recovered.csv\n";
+        if (recovered.cancelled) {
+            std::cout << "cancelled\n";
+        }
+        return 0;
+    }
+
+    if (freeOnly) {
         options.ranges = carver::freeClusterRanges(bitmap, volume.totalClusters(), volume.bytesPerCluster);
 
         uint64_t freeBytes = 0;
@@ -151,9 +213,6 @@ int main(int argc, char** argv) {
             freeBytes += range.end - range.start;
         }
 
-        std::cout << "filesystem : NTFS, " << volume.bytesPerCluster << " byte clusters\n";
-        std::cout << "clusters   : " << volume.totalClusters() << "\n";
-        std::cout << "bitmap     : " << bitmap.size() << " bytes\n";
         std::cout << "free       : " << options.ranges.size() << " extents, "
                   << humanBytes(freeBytes) << "\n\n";
 
