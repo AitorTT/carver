@@ -487,21 +487,36 @@ void buildUi(UiState& ui, Job& job) {
         finished = job.finished;
     }
 
+    const bool recordBased = (ui.mode == Mode::MftRecover);
+
     const double fraction = snapshot.bytesTotal == 0
                                 ? (finished ? 1.0 : 0.0)
                                 : static_cast<double>(snapshot.bytesScanned) / static_cast<double>(snapshot.bytesTotal);
 
-    char overlay[128];
-    std::snprintf(overlay, sizeof(overlay), "%.1f%%  (%.1f MiB of %.1f MiB)",
-                  fraction * 100.0,
-                  static_cast<double>(snapshot.bytesScanned) / (1024.0 * 1024.0),
-                  static_cast<double>(snapshot.bytesTotal) / (1024.0 * 1024.0));
+    char overlay[160];
+    if (recordBased) {
+        std::snprintf(overlay, sizeof(overlay), "%.1f%%  (%llu of %llu MFT records)",
+                      fraction * 100.0,
+                      static_cast<unsigned long long>(snapshot.bytesScanned),
+                      static_cast<unsigned long long>(snapshot.bytesTotal));
+    } else {
+        std::snprintf(overlay, sizeof(overlay), "%.1f%%  (%.1f MiB of %.1f MiB)",
+                      fraction * 100.0,
+                      static_cast<double>(snapshot.bytesScanned) / (1024.0 * 1024.0),
+                      static_cast<double>(snapshot.bytesTotal) / (1024.0 * 1024.0));
+    }
     ImGui::ProgressBar(static_cast<float>(fraction), ImVec2(-1, 22), overlay);
 
-    ImGui::Text("files: %llu      written: %s      unallocated extents scanned as bytes: %s",
-                static_cast<unsigned long long>(job.filesWritten),
-                humanBytes(job.bytesWritten).c_str(),
-                humanBytes(snapshot.bytesScanned).c_str());
+    if (recordBased) {
+        ImGui::Text("files recovered: %llu      bytes written: %s",
+                    static_cast<unsigned long long>(job.filesWritten),
+                    humanBytes(job.bytesWritten).c_str());
+    } else {
+        ImGui::Text("files recovered: %llu      bytes written: %s      scanned: %s",
+                    static_cast<unsigned long long>(job.filesWritten),
+                    humanBytes(job.bytesWritten).c_str(),
+                    humanBytes(snapshot.bytesScanned).c_str());
+    }
 
     if (job.recordsScanned > 0) {
         ImGui::Text("mft records: %llu      deleted entries: %llu      possibly overwritten: %llu",
