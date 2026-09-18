@@ -572,7 +572,27 @@ void buildUi(UiState& ui, Job& job, Enumeration& enumeration) {
         ImGui::Spacing();
     }
 
-    const bool canStart = !busy && !resolvedSource.empty() && ui.outputPath[0] != '\0';
+    bool sameDisk = false;
+    if (!resolvedSource.empty() && ui.outputPath[0] != '\0') {
+        const std::string outputMount = carver::mountPointOfPath(ui.outputPath);
+        if (!outputMount.empty()) {
+            const uint32_t sourceDisk = carver::physicalDiskOfDevicePath(resolvedSource);
+            const uint32_t outputDisk = carver::physicalDiskOfMountPoint(outputMount);
+            sameDisk = sourceDisk != carver::UNKNOWN_PHYSICAL_DISK &&
+                       outputDisk != carver::UNKNOWN_PHYSICAL_DISK &&
+                       sourceDisk == outputDisk;
+        }
+    }
+
+    if (sameDisk) {
+        ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f),
+                           "Blocked: the output folder is on the same physical disk as the source.");
+        ImGui::TextWrapped("Writing recovered files there can overwrite the very clusters being "
+                           "recovered. Choose a folder on a different disk.");
+        ImGui::Spacing();
+    }
+
+    const bool canStart = !busy && !sameDisk && !resolvedSource.empty() && ui.outputPath[0] != '\0';
 
     if (busy) {
         if (ImGui::Button("Stop", ImVec2(140, 32))) {
@@ -888,10 +908,21 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
 
             if (!ui.selectionInitialised && (!ui.volumes.empty() || !ui.drives.empty())) {
                 ui.selectionInitialised = true;
+                const std::string systemMount = carver::systemVolumeMountPoint();
+
                 for (int index = 0; index < static_cast<int>(ui.volumes.size()); ++index) {
-                    if (carver::isNtfsVolume(ui.volumes[index])) {
+                    if (carver::isNtfsVolume(ui.volumes[index]) &&
+                        ui.volumes[index].mountPoint != systemMount) {
                         ui.selectedVolume = index;
                         break;
+                    }
+                }
+                if (ui.selectedVolume < 0) {
+                    for (int index = 0; index < static_cast<int>(ui.volumes.size()); ++index) {
+                        if (ui.volumes[index].mountPoint != systemMount) {
+                            ui.selectedVolume = index;
+                            break;
+                        }
                     }
                 }
                 if (ui.selectedVolume < 0 && !ui.volumes.empty()) {

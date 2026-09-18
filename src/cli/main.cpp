@@ -55,18 +55,38 @@ void printDrives() {
 
     const auto drives = carver::listPhysicalDrives();
     if (drives.empty()) {
-        std::cout << "no physical drives could be opened\n";
+        std::cout << "no physical drives could be opened"
+                     " (raw device access requires an elevated process)\n";
+    } else {
+        for (const auto& drive : drives) {
+            std::printf("  %-24s %10s  sector %-5u %-8s %s%s\n",
+                        drive.devicePath.c_str(),
+                        humanBytes(drive.size).c_str(),
+                        drive.sectorSize,
+                        drive.busType.c_str(),
+                        drive.model.c_str(),
+                        drive.removable ? "  [removable]" : "");
+        }
+    }
+
+    const auto volumes = carver::listVolumes();
+    std::cout << "\nvolumes:\n";
+    if (volumes.empty()) {
+        std::cout << "  none\n";
         return;
     }
 
-    for (const auto& drive : drives) {
-        std::printf("  %-24s %10s  sector %-5u %-8s %s%s\n",
-                    drive.devicePath.c_str(),
-                    humanBytes(drive.size).c_str(),
-                    drive.sectorSize,
-                    drive.busType.c_str(),
-                    drive.model.c_str(),
-                    drive.removable ? "  [removable]" : "");
+    for (const auto& volume : volumes) {
+        const std::string disk = volume.diskNumber == carver::UNKNOWN_PHYSICAL_DISK
+                                     ? std::string("?")
+                                     : std::to_string(volume.diskNumber);
+        std::printf("  %-5s disk %-3s %-7s %10s  %s  (%s)\n",
+                    volume.mountPoint.c_str(),
+                    disk.c_str(),
+                    volume.fileSystem.empty() ? "-" : volume.fileSystem.c_str(),
+                    humanBytes(volume.size).c_str(),
+                    volume.label.c_str(),
+                    volume.devicePath.c_str());
     }
 }
 

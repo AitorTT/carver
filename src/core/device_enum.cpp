@@ -5,6 +5,9 @@
 #include <windows.h>
 #include <winioctl.h>
 
+#include <cstdlib>
+#include <cstring>
+
 namespace carver {
 
 namespace {
@@ -129,6 +132,8 @@ std::vector<VolumeInfo> listVolumes() {
             info.free = totalFree.QuadPart;
         }
 
+        info.diskNumber = physicalDiskOfMountPoint(info.mountPoint);
+
         volumes.push_back(std::move(info));
     }
 
@@ -137,6 +142,76 @@ std::vector<VolumeInfo> listVolumes() {
 
 bool isNtfsVolume(const VolumeInfo& volume) {
     return volume.fileSystem == "NTFS";
+}
+
+uint32_t physicalDiskOfDevicePath(const std::string& devicePath) {
+    constexpr const char* PHYSICAL_PREFIX = "\\\\.\\PhysicalDrive";
+
+    if (devicePath.rfind(PHYSICAL_PREFIX, 0) == 0) {
+        return static_cast<uint32_t>(std::strtoul(devicePath.c_str() + std::strlen(PHYSICAL_PREFIX), nullptr, 10));
+    }
+
+    return physicalDiskOfMountPoint(devicePath);
+}
+
+uint32_t physicalDiskOfMountPoint(const std::string& mountPoint) {
+    const std::string cleaned = mountPoint.empty() ? std::string() : mountPoint;
+    if (cleaned.size() < 2 || cleaned[1] != ':') {
+        return UNKNOWN_PHYSICAL_DISK;
+    }
+
+    std::wstring devicePath = L"\\\\.\\";
+    devicePath += static_cast<wchar_t>(std::toupper(static_cast<unsigned char>(cleaned[0])));
+    devicePath += L':';
+
+    HANDLE handle = CreateFileW(devicePath.c_str(), 0,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                nullptr, OPEN_EXISTING, 0, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        return UNKNOWN_PHYSICAL_DISK;
+    }
+
+    std::vector<uint8_t> buffer(sizeof(VOLUME_DISK_EXTENTS) + sizeof(DISK_EXTENT) * 16, 0);
+    DWORD returned = 0;
+    const BOOL ok = DeviceIoControl(handle, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, nullptr, 0,
+                                    buffer.data(), static_cast<DWORD>(buffer.size()), &returned, nullptr);
+    CloseHandle(handle);
+
+    if (!ok) {
+        return UNKNOWN_PHYSICAL_DISK;
+    }
+
+    const auto* extents = reinterpret_cast<const VOLUME_DISK_EXTENTS*>(buffer.data());
+    if (extents->NumberOfDiskExtents == 0) {
+        return UNKNOWN_PHYSICAL_DISK;
+    }
+
+    return extents->Extents[0].DiskNumber;
+}
+
+std::string mountPointOfPath(const std::string& path) {
+    if (path.empty()) {
+        return {};
+    }
+
+    wchar_t buffer[MAX_PATH] = {};
+    if (!GetVolumePathNameW(utf8ToWide(path).c_str(), buffer, MAX_PATH)) {
+        return {};
+    }
+
+    return wideToUtf8(buffer);
+}
+
+std::string systemVolumeMountPoint() {
+    wchar_t windowsDirectory[MAX_PATH] = {};
+    if (GetWindowsDirectoryW(windowsDirectory, MAX_PATH) == 0 || windowsDirectory[0] == L'\0') {
+        return {};
+    }
+
+    std::wstring mountPoint;
+    mountPoint += windowsDirectory[0];
+    mountPoint += L":\\";
+    return wideToUtf8(mountPoint);
 }
 
 }
