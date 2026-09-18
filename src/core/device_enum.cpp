@@ -35,6 +35,22 @@ std::string describeBusType(STORAGE_BUS_TYPE type) {
     }
 }
 
+bool querySeekPenalty(HANDLE handle, bool& rotational) {
+    STORAGE_PROPERTY_QUERY query{};
+    query.PropertyId = StorageDeviceSeekPenaltyProperty;
+    query.QueryType = PropertyStandardQuery;
+
+    DEVICE_SEEK_PENALTY_DESCRIPTOR penalty{};
+    DWORD returned = 0;
+    if (!DeviceIoControl(handle, IOCTL_STORAGE_QUERY_PROPERTY, &query, sizeof(query),
+                         &penalty, sizeof(penalty), &returned, nullptr)) {
+        return false;
+    }
+
+    rotational = penalty.IncursSeekPenalty != 0;
+    return true;
+}
+
 std::string readProductId(const std::vector<uint8_t>& buffer, DWORD returned) {
     const auto* descriptor = reinterpret_cast<const STORAGE_DEVICE_DESCRIPTOR*>(buffer.data());
     if (descriptor->ProductIdOffset == 0 || descriptor->ProductIdOffset >= returned) {
@@ -88,6 +104,11 @@ std::vector<DriveInfo> listPhysicalDrives() {
             info.removable = descriptor->RemovableMedia != 0;
         }
 
+        bool rotational = true;
+        if (querySeekPenalty(handle, rotational)) {
+            info.rotational = rotational;
+        }
+
         drives.push_back(std::move(info));
         CloseHandle(handle);
     }
@@ -133,6 +154,11 @@ std::vector<VolumeInfo> listVolumes() {
         }
 
         info.diskNumber = physicalDiskOfMountPoint(info.mountPoint);
+
+        bool rotational = true;
+        if (physicalDiskIsRotational(info.diskNumber, rotational)) {
+            info.rotational = rotational;
+        }
 
         volumes.push_back(std::move(info));
     }
@@ -212,6 +238,40 @@ std::string systemVolumeMountPoint() {
     mountPoint += windowsDirectory[0];
     mountPoint += L":\\";
     return wideToUtf8(mountPoint);
+}
+
+bool physicalDiskIsRotational(uint32_t diskNumber, bool& rotational) {
+    if (diskNumber == UNKNOWN_PHYSICAL_DISK) {
+        return false;
+    }
+
+    const std::wstring path = L"\\\\.\\PhysicalDrive" + std::to_wstring(diskNumber);
+    HANDLE handle = CreateFileW(path.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                OPEN_EXISTING, 0, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    const bool ok = querySeekPenalty(handle, rotational);
+    CloseHandle(handle);
+    return ok;
+}
+
+bool volumeFreeSpace(const std::string& mountPoint, uint64_t& freeBytes, uint64_t& totalBytes) {
+    if (mountPoint.empty()) {
+        return false;
+    }
+
+    ULARGE_INTEGER availableToCaller{};
+    ULARGE_INTEGER total{};
+    ULARGE_INTEGER free{};
+    if (!GetDiskFreeSpaceExW(utf8ToWide(mountPoint).c_str(), &availableToCaller, &total, &free)) {
+        return false;
+    }
+
+    freeBytes = availableToCaller.QuadPart;
+    totalBytes = total.QuadPart;
+    return true;
 }
 
 }

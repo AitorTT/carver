@@ -485,7 +485,8 @@ void buildUi(UiState& ui, Job& job, Enumeration& enumeration) {
             for (int index = 0; index < static_cast<int>(ui.volumes.size()); ++index) {
                 const auto& volume = ui.volumes[index];
                 char label[320];
-                std::snprintf(label, sizeof(label), "%-4s %-6s %9s  %s", volume.mountPoint.c_str(),
+                std::snprintf(label, sizeof(label), "%-4s %-5s %-6s %9s  %s", volume.mountPoint.c_str(),
+                              volume.rotational ? "HDD" : "SSD",
                               volume.fileSystem.c_str(), humanBytes(volume.size).c_str(),
                               volume.label.c_str());
                 if (ImGui::Selectable(label, ui.selectedVolume == index)) {
@@ -499,9 +500,9 @@ void buildUi(UiState& ui, Job& job, Enumeration& enumeration) {
             for (int index = 0; index < static_cast<int>(ui.drives.size()); ++index) {
                 const auto& drive = ui.drives[index];
                 char label[320];
-                std::snprintf(label, sizeof(label), "%-22s %9s  %-7s %s", drive.devicePath.c_str(),
-                              humanBytes(drive.size).c_str(), describeBusType(drive.busType).c_str(),
-                              drive.model.c_str());
+                std::snprintf(label, sizeof(label), "%-22s %-5s %9s  %-7s %s", drive.devicePath.c_str(),
+                              drive.rotational ? "HDD" : "SSD", humanBytes(drive.size).c_str(),
+                              describeBusType(drive.busType).c_str(), drive.model.c_str());
                 if (ImGui::Selectable(label, ui.selectedDrive == index)) {
                     ui.selectedDrive = index;
                 }
@@ -547,16 +548,19 @@ void buildUi(UiState& ui, Job& job, Enumeration& enumeration) {
 
     std::string resolvedSource;
     bool targetIsNtfsVolume = false;
+    bool targetRotational = true;
 
     if (ui.source == SourceKind::Volume) {
         if (ui.selectedVolume >= 0 && ui.selectedVolume < static_cast<int>(ui.volumes.size())) {
             const auto& volume = ui.volumes[ui.selectedVolume];
             resolvedSource = volume.devicePath;
             targetIsNtfsVolume = volume.fileSystem == "NTFS";
+            targetRotational = volume.rotational;
         }
     } else if (ui.source == SourceKind::PhysicalDrive) {
         if (ui.selectedDrive >= 0 && ui.selectedDrive < static_cast<int>(ui.drives.size())) {
             resolvedSource = ui.drives[ui.selectedDrive].devicePath;
+            targetRotational = ui.drives[ui.selectedDrive].rotational;
         }
     } else {
         resolvedSource = ui.imagePath;
@@ -572,8 +576,17 @@ void buildUi(UiState& ui, Job& job, Enumeration& enumeration) {
         ImGui::Spacing();
     }
 
+    if (ui.mode == Mode::MftRecover && !targetRotational) {
+        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f),
+                           "Warning: target is a solid-state drive.");
+        ImGui::TextWrapped("Deleted data on SSDs is usually erased by TRIM within seconds of "
+                           "deletion, so little or nothing may be recoverable. Imaging the drive "
+                           "and carving live data still works.");
+        ImGui::Spacing();
+    }
+
     bool sameDisk = false;
-    if (!resolvedSource.empty() && ui.outputPath[0] != '\0') {
+    if (ui.source != SourceKind::ImageFile && !resolvedSource.empty() && ui.outputPath[0] != '\0') {
         const std::string outputMount = carver::mountPointOfPath(ui.outputPath);
         if (!outputMount.empty()) {
             const uint32_t sourceDisk = carver::physicalDiskOfDevicePath(resolvedSource);

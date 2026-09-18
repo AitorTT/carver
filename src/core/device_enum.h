@@ -15,6 +15,7 @@ struct DriveInfo {
     uint64_t size = 0;
     uint32_t sectorSize = 0;
     bool removable = false;
+    bool rotational = true;
 };
 
 struct VolumeInfo {
@@ -25,6 +26,7 @@ struct VolumeInfo {
     uint64_t size = 0;
     uint64_t free = 0;
     uint32_t diskNumber = UNKNOWN_PHYSICAL_DISK;
+    bool rotational = true;
 };
 
 std::vector<DriveInfo> listPhysicalDrives();
@@ -40,5 +42,9 @@ uint32_t physicalDiskOfMountPoint(const std::string& mountPoint);
 std::string mountPointOfPath(const std::string& path);
 
 std::string systemVolumeMountPoint();
+
+bool physicalDiskIsRotational(uint32_t diskNumber, bool& rotational);
+
+bool volumeFreeSpace(const std::string& mountPoint, uint64_t& freeBytes, uint64_t& totalBytes);
 
 }

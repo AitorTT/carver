@@ -18,6 +18,7 @@ endif()
 add_library(carver_core STATIC
   src/core/device.cpp
   src/core/device_enum.cpp
+  src/core/image.cpp
   src/core/ntfs.cpp
   src/core/recover.cpp
   src/core/signature.cpp
@@ -27,7 +28,7 @@ add_library(carver_core STATIC
 target_include_directories(carver_core PUBLIC src)
 
 if(WIN32)
-  target_link_libraries(carver_core PUBLIC setupapi)
+  target_link_libraries(carver_core PUBLIC setupapi bcrypt)
 endif()
 
 add_executable(carver-cli src/cli/main.cpp)

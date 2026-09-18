@@ -1,6 +1,7 @@
 #include "core/carver.h"
 #include "core/device.h"
 #include "core/device_enum.h"
+#include "core/image.h"
 #include "core/ntfs.h"
 #include "core/recover.h"
 #include "core/signature.h"
@@ -32,6 +33,8 @@ void printUsage() {
         "                    (input must be an NTFS volume)\n"
         "  --probe <input>   hex dump raw bytes, to check that a device reads correctly\n"
         "        [--offset <bytes>] [--length <bytes>]\n"
+        "  --image <input> <destination>   write a byte-for-byte copy and SHA-256 hash\n"
+        "        [--start <bytes>] [--end <bytes>]\n"
         "\n"
         "input is a disk image file, or a raw device such as\n"
         "\\\\.\\PhysicalDrive2 which requires an elevated shell.\n";
@@ -59,9 +62,10 @@ void printDrives() {
                      " (raw device access requires an elevated process)\n";
     } else {
         for (const auto& drive : drives) {
-            std::printf("  %-24s %10s  sector %-5u %-8s %s%s\n",
+            std::printf("  %-24s %10s  %-4s sector %-5u %-8s %s%s\n",
                         drive.devicePath.c_str(),
                         humanBytes(drive.size).c_str(),
+                        drive.rotational ? "HDD" : "SSD",
                         drive.sectorSize,
                         drive.busType.c_str(),
                         drive.model.c_str(),
@@ -107,6 +111,116 @@ int main(int argc, char** argv) {
 
     if (args[0] == "--list") {
         printDrives();
+        return 0;
+    }
+
+    if (args[0] == "--image") {
+        std::string sourcePath;
+        std::string destinationPath;
+        carver::ImageOptions imageOptions;
+
+        for (size_t index = 1; index < args.size(); ++index) {
+            if (args[index] == "--start" && index + 1 < args.size()) {
+                imageOptions.startOffset = std::strtoull(args[++index].c_str(), nullptr, 0);
+            } else if (args[index] == "--end" && index + 1 < args.size()) {
+                imageOptions.endOffset = std::strtoull(args[++index].c_str(), nullptr, 0);
+            } else if (args[index] == "--chunk" && index + 1 < args.size()) {
+                imageOptions.chunkSize = std::strtoull(args[++index].c_str(), nullptr, 0);
+            } else if (sourcePath.empty()) {
+                sourcePath = args[index];
+            } else if (destinationPath.empty()) {
+                destinationPath = args[index];
+            }
+        }
+
+        if (sourcePath.empty() || destinationPath.empty()) {
+            std::cerr << "error: --image needs a source and a destination\n";
+            return 1;
+        }
+
+        carver::RawDevice device;
+        std::string error;
+        if (!device.open(carver::utf8ToWide(sourcePath), error)) {
+            std::cerr << "error: " << error << "\n";
+            return 1;
+        }
+
+        const uint64_t begin = std::min(imageOptions.startOffset, device.size());
+        const uint64_t finish = (imageOptions.endOffset == 0 || imageOptions.endOffset > device.size())
+                                    ? device.size()
+                                    : imageOptions.endOffset;
+        if (begin >= finish) {
+            std::cerr << "error: image range is empty\n";
+            return 1;
+        }
+        const uint64_t imageBytes = finish - begin;
+
+        const std::string destinationMount = carver::mountPointOfPath(destinationPath);
+        if (destinationMount.empty()) {
+            std::cerr << "error: cannot resolve the destination volume for " << destinationPath << "\n";
+            return 1;
+        }
+
+        const uint32_t sourceDisk = carver::physicalDiskOfDevicePath(sourcePath);
+        const uint32_t destinationDisk = carver::physicalDiskOfMountPoint(destinationMount);
+        const bool sourceIsDevice = sourcePath.rfind("\\\\.\\", 0) == 0;
+        if (sourceIsDevice &&
+            sourceDisk != carver::UNKNOWN_PHYSICAL_DISK &&
+            destinationDisk != carver::UNKNOWN_PHYSICAL_DISK &&
+            sourceDisk == destinationDisk) {
+            std::cerr << "error: refusing to write the image onto the source disk (disk "
+                      << sourceDisk << ").\n"
+                      << "       Writing there can overwrite the data being imaged.\n"
+                      << "       Choose a destination on a different physical disk.\n";
+            return 1;
+        }
+
+        uint64_t freeBytes = 0;
+        uint64_t totalBytes = 0;
+        if (carver::volumeFreeSpace(destinationMount, freeBytes, totalBytes) && freeBytes < imageBytes) {
+            std::cerr << "error: not enough space on " << destinationMount << " for a "
+                      << humanBytes(imageBytes) << " image (" << humanBytes(freeBytes) << " free)\n";
+            return 1;
+        }
+
+        std::cout << "source : " << sourcePath << "\n";
+        std::cout << "size   : " << humanBytes(device.size()) << "\n";
+        std::cout << "sector : " << device.sectorSize() << " bytes\n";
+        std::cout << "range  : " << begin << " .. " << finish << "  (" << humanBytes(imageBytes) << ")\n";
+        std::cout << "dest   : " << destinationPath << "\n";
+        std::cout << "free   : " << humanBytes(freeBytes) << " on " << destinationMount << "\n\n";
+
+        const auto imageProgress = [imageBytes](const carver::ImageProgress& state) {
+            const double percent = state.bytesTotal == 0
+                                        ? 100.0
+                                        : (static_cast<double>(state.bytesDone) /
+                                           static_cast<double>(state.bytesTotal)) * 100.0;
+            const double remaining = state.bytesPerSecond > 0.0
+                                         ? static_cast<double>(imageBytes - state.bytesDone) / state.bytesPerSecond
+                                         : 0.0;
+            std::printf("\r[%5.1f%%] %10s  %9.1f MiB/s  ETA %s        ",
+                        percent,
+                        humanBytes(state.bytesDone).c_str(),
+                        state.bytesPerSecond / (1024.0 * 1024.0),
+                        humanBytes(static_cast<uint64_t>(remaining)).c_str());
+            std::fflush(stdout);
+            return true;
+        };
+
+        carver::ImageResult imageResult;
+        const bool imaged = carver::createImage(device, destinationPath, imageOptions,
+                                                imageProgress, imageResult, error);
+        std::printf("\n\n");
+
+        if (!imaged) {
+            std::cerr << "error: " << (error.empty() ? "imaging cancelled" : error) << "\n";
+            return 1;
+        }
+
+        std::cout << "bytes written : " << imageResult.bytesWritten << " ("
+                  << humanBytes(imageResult.bytesWritten) << ")\n";
+        std::cout << "sha256        : " << imageResult.sha256 << "\n";
+        std::cout << "\nverify with   : certutil -hashfile \"" << destinationPath << "\" SHA256\n";
         return 0;
     }
 
@@ -237,6 +351,16 @@ int main(int argc, char** argv) {
         std::cout << "filesystem : NTFS, " << volume.bytesPerCluster << " byte clusters\n";
         std::cout << "clusters   : " << volume.totalClusters() << "\n";
         std::cout << "bitmap     : " << bitmap.size() << " bytes\n";
+
+        const uint32_t diskNumber = carver::physicalDiskOfDevicePath(inputPath);
+        bool rotational = true;
+        if (carver::physicalDiskIsRotational(diskNumber, rotational) && !rotational) {
+            std::cout << "\n";
+            std::cout << "WARNING: this target is on a solid-state drive.\n";
+            std::cout << "         Deleted data on SSDs is usually erased by TRIM within seconds of\n";
+            std::cout << "         deletion, so recovering deleted files from it is unlikely to work.\n";
+            std::cout << "         Signature carving of live data still works.\n";
+        }
     }
 
     if (mftRecover) {
