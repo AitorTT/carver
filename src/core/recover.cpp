@@ -229,8 +229,7 @@ RecoverResult recoverDeletedFiles(RawDevice& device,
         return result;
     }
 
-    Progress state;
-    state.bytesTotal = recordCount;
+    Progress state;    state.bytesTotal = recordCount;
 
     uint64_t fileIndex = 0;
     uint64_t processed = 0;

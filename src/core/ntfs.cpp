@@ -620,11 +620,15 @@ bool readBitmap(RawDevice& device, const NtfsVolumeInfo& info, std::vector<uint8
 }
 
 std::vector<ByteRange> freeClusterRanges(const std::vector<uint8_t>& bitmap, uint64_t totalClusters,
-                                         uint64_t bytesPerCluster) {
+                                         uint64_t bytesPerCluster, uint64_t baseOffset) {
     std::vector<ByteRange> ranges;
     if (bytesPerCluster == 0) {
         return ranges;
     }
+
+    const auto toBytes = [bytesPerCluster, baseOffset](uint64_t cluster) {
+        return baseOffset + cluster * bytesPerCluster;
+    };
 
     bool inFreeRange = false;
     uint64_t rangeStart = 0;
@@ -641,13 +645,13 @@ std::vector<ByteRange> freeClusterRanges(const std::vector<uint8_t>& bitmap, uin
                 inFreeRange = true;
             }
         } else if (inFreeRange) {
-            ranges.push_back(ByteRange{rangeStart * bytesPerCluster, cluster * bytesPerCluster});
+            ranges.push_back(ByteRange{toBytes(rangeStart), toBytes(cluster)});
             inFreeRange = false;
         }
     }
 
     if (inFreeRange) {
-        ranges.push_back(ByteRange{rangeStart * bytesPerCluster, totalClusters * bytesPerCluster});
+        ranges.push_back(ByteRange{toBytes(rangeStart), toBytes(totalClusters)});
     }
 
     return ranges;

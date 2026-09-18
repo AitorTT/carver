@@ -10,6 +10,7 @@
 namespace carver {
 
 struct NtfsVolumeInfo {
+    uint64_t baseOffset = 0;
     uint32_t bytesPerSector = 0;
     uint32_t bytesPerCluster = 0;
     uint64_t totalSectors = 0;
@@ -19,7 +20,7 @@ struct NtfsVolumeInfo {
     uint32_t indexBufferSize = 0;
 
     uint64_t totalClusters() const { return bytesPerCluster == 0 ? 0 : (totalSectors * bytesPerSector) / bytesPerCluster; }
-    uint64_t clusterOffset(uint64_t cluster) const { return cluster * bytesPerCluster; }
+    uint64_t clusterOffset(uint64_t cluster) const { return baseOffset + cluster * bytesPerCluster; }
 };
 
 struct DataRun {
@@ -93,6 +94,7 @@ bool readFileRecordData(RawDevice& device, const NtfsVolumeInfo& info, uint64_t 
 
 bool readBitmap(RawDevice& device, const NtfsVolumeInfo& info, std::vector<uint8_t>& bitmap, std::string& error);
 
-std::vector<ByteRange> freeClusterRanges(const std::vector<uint8_t>& bitmap, uint64_t totalClusters, uint64_t bytesPerCluster);
+std::vector<ByteRange> freeClusterRanges(const std::vector<uint8_t>& bitmap, uint64_t totalClusters,
+                                         uint64_t bytesPerCluster, uint64_t baseOffset = 0);
 
 }

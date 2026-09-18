@@ -3,6 +3,7 @@
 #include "core/device_enum.h"
 #include "core/image.h"
 #include "core/ntfs.h"
+#include "core/partition.h"
 #include "core/recover.h"
 #include "core/signature.h"
 
@@ -35,6 +36,8 @@ void printUsage() {
         "        [--offset <bytes>] [--length <bytes>]\n"
         "  --image <input> <destination>   write a byte-for-byte copy and SHA-256 hash\n"
         "        [--start <bytes>] [--end <bytes>]\n"
+        "  --partitions <input>   list the partitions on a disk or image\n"
+        "  --partition <n>        use partition n as the NTFS volume (default: auto)\n"
         "\n"
         "input is a disk image file, or a raw device such as\n"
         "\\\\.\\PhysicalDrive2 which requires an elevated shell.\n";
@@ -224,6 +227,58 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    if (args[0] == "--partitions") {
+        if (args.size() < 2) {
+            std::cerr << "error: --partitions needs an input\n";
+            return 1;
+        }
+
+        carver::RawDevice device;
+        std::string error;
+        if (!device.open(carver::utf8ToWide(args[1]), error)) {
+            std::cerr << "error: " << error << "\n";
+            return 1;
+        }
+
+        const auto partitions = carver::parsePartitions(device, error);
+        if (!error.empty()) {
+            std::cerr << "error: " << error << "\n";
+            return 1;
+        }
+
+        std::cout << "input : " << args[1] << "\n";
+        std::cout << "size  : " << humanBytes(device.size()) << "\n\n";
+
+        if (partitions.empty()) {
+            std::cout << "no partition table found (a bare NTFS volume has none; use it directly)\n";
+            return 0;
+        }
+
+        std::printf("  %-3s %-14s %-12s %-11s %-26s %s\n", "#", "scheme", "offset", "size", "type", "label");
+        for (const auto& partition : partitions) {
+            const std::string index = partition.index == 0 ? std::string("-") : std::to_string(partition.index);
+            std::printf("  %-3s %-14s %-12s %-11s %-26s %s\n",
+                        index.c_str(),
+                        partition.scheme.c_str(),
+                        humanBytes(partition.offset).c_str(),
+                        humanBytes(partition.size).c_str(),
+                        partition.typeName.c_str(),
+                        partition.label.c_str());
+        }
+
+        std::cout << "\n";
+        for (const auto& partition : partitions) {
+            if (partition.index == 0) {
+                continue;
+            }
+            std::cout << "  partition " << partition.index << " at " << partition.offset
+                      << " : NTFS boot sector "
+                      << (carver::quickNtfsCheck(device, partition.offset) ? "present" : "not found")
+                      << "\n";
+        }
+        return 0;
+    }
+
     if (args[0] == "--probe") {
         std::string path;
         uint64_t offset = 0;
@@ -292,6 +347,7 @@ int main(int argc, char** argv) {
     carver::CarveOptions options;
     bool freeOnly = false;
     bool mftRecover = false;
+    std::string partitionSelection;
 
     for (size_t index = 2; index < args.size(); ++index) {
         const std::string& flag = args[index];
@@ -313,6 +369,8 @@ int main(int argc, char** argv) {
             options.endOffset = std::strtoull(args[++index].c_str(), nullptr, 0);
         } else if (flag == "--chunk") {
             options.chunkSize = std::strtoull(args[++index].c_str(), nullptr, 0);
+        } else if (flag == "--partition") {
+            partitionSelection = args[++index];
         } else {
             std::cerr << "error: unknown option " << flag << "\n";
             return 1;
@@ -332,17 +390,56 @@ int main(int argc, char** argv) {
     carver::NtfsVolumeInfo volume;
     std::vector<uint8_t> bitmap;
 
+    uint64_t partitionOffset = 0;
+    uint64_t partitionSize = device.size();
+    bool partitionResolved = false;
+
+    const bool needsNtfsBase = freeOnly || mftRecover || !partitionSelection.empty();
+
+    if (needsNtfsBase) {
+        carver::PartitionResolution resolution;
+        if (!carver::resolveNtfsBase(device, partitionSelection, resolution, error)) {
+            std::cerr << "error: " << error << "\n";
+            return 1;
+        }
+
+        partitionOffset = resolution.offset;
+        partitionSize = resolution.size;
+        partitionResolved = resolution.found;
+
+        if (resolution.autoSelected) {
+            std::cout << "auto-selected partition " << resolution.index << " ("
+                      << resolution.typeName << ") at offset " << resolution.offset;
+            if (!resolution.label.empty()) {
+                std::cout << "  label \"" << resolution.label << "\"";
+            }
+            std::cout << "\n";
+        }
+    }
+
+    if (!partitionSelection.empty() && !needsNtfsBase) {
+        options.startOffset = partitionOffset;
+        options.endOffset = partitionOffset + partitionSize;
+    }
+
     if (freeOnly || mftRecover) {
+        if (!partitionResolved) {
+            std::cerr << "error: cannot work out which volume to use\n";
+            return 1;
+        }
+
         std::vector<uint8_t> bootSector(512, 0);
         uint32_t got = 0;
-        if (!device.readAt(0, bootSector.data(), static_cast<uint32_t>(bootSector.size()), got, error) || got < 512) {
-            std::cerr << "error: cannot read boot sector: " << error << "\n";
+        if (!device.readAt(partitionOffset, bootSector.data(), static_cast<uint32_t>(bootSector.size()), got, error) ||
+            got < 512) {
+            std::cerr << "error: cannot read the boot sector at offset " << partitionOffset << ": " << error << "\n";
             return 1;
         }
         if (!carver::parseNtfsBootSector(bootSector.data(), got, volume, error)) {
             std::cerr << "error: input is not an NTFS volume: " << error << "\n";
             return 1;
         }
+        volume.baseOffset = partitionOffset;
         if (!carver::readBitmap(device, volume, bitmap, error)) {
             std::cerr << "error: cannot read $Bitmap: " << error << "\n";
             return 1;
@@ -413,7 +510,8 @@ int main(int argc, char** argv) {
     }
 
     if (freeOnly) {
-        options.ranges = carver::freeClusterRanges(bitmap, volume.totalClusters(), volume.bytesPerCluster);
+        options.ranges = carver::freeClusterRanges(bitmap, volume.totalClusters(),
+                                                  volume.bytesPerCluster, volume.baseOffset);
 
         uint64_t freeBytes = 0;
         for (const auto& range : options.ranges) {
