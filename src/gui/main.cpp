@@ -2,6 +2,7 @@
 #include <commdlg.h>
 #include <d3d11.h>
 #include <dxgi.h>
+#include <shellapi.h>
 #include <shlobj.h>
 
 #include <atomic>
@@ -72,6 +73,42 @@ std::string humanBytes(uint64_t value) {
     char buffer[64];
     std::snprintf(buffer, sizeof(buffer), "%.1f %s", size, units[unit]);
     return buffer;
+}
+
+std::wstring buildParameterString(LPWSTR* argv, int argc) {
+    std::wstring parameters;
+    for (int index = 1; index < argc; ++index) {
+        if (!parameters.empty()) {
+            parameters += L' ';
+        }
+        parameters += L'"';
+        parameters += argv[index];
+        parameters += L'"';
+    }
+    return parameters;
+}
+
+bool relaunchElevated(const std::wstring& parameters) {
+    wchar_t modulePath[MAX_PATH] = {};
+    if (GetModuleFileNameW(nullptr, modulePath, MAX_PATH) == 0) {
+        return false;
+    }
+
+    SHELLEXECUTEINFOW info{};
+    info.cbSize = sizeof(info);
+    info.fMask = SEE_MASK_NOCLOSEPROCESS;
+    info.lpVerb = L"runas";
+    info.lpFile = modulePath;
+    info.lpParameters = parameters.empty() ? nullptr : parameters.c_str();
+    info.nShow = SW_SHOWNORMAL;
+
+    if (!ShellExecuteExW(&info)) {
+        return false;
+    }
+    if (info.hProcess != nullptr) {
+        CloseHandle(info.hProcess);
+    }
+    return true;
 }
 
 std::string describeBusType(const std::string& bus) {
@@ -653,12 +690,25 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
             logPath = argument;
         }
     }
+
+    const std::wstring parameters = buildParameterString(argv, argc);
     if (argv != nullptr) {
         LocalFree(argv);
     }
 
     if (selfTest) {
         return runSelfTest(logPath);
+    }
+
+    if (!carver::isElevated()) {
+        if (relaunchElevated(parameters)) {
+            return 0;
+        }
+        MessageBoxW(nullptr,
+                    L"carver needs administrator rights to read physical drives.\n\n"
+                    L"The elevated launch was cancelled, so carver will exit.",
+                    L"carver", MB_OK | MB_ICONWARNING);
+        return 1;
     }
 
     const wchar_t* className = L"carverWindowClass";
@@ -671,7 +721,11 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
     windowClass.lpszClassName = className;
     RegisterClassExW(&windowClass);
 
-    g_window = CreateWindowExW(0, className, L"carver - file recovery", WS_OVERLAPPEDWINDOW,
+    const std::wstring windowTitle = carver::isElevated()
+                                         ? std::wstring(L"carver - file recovery  [administrator]")
+                                         : std::wstring(L"carver - file recovery");
+
+    g_window = CreateWindowExW(0, className, windowTitle.c_str(), WS_OVERLAPPEDWINDOW,
                                100, 100, 1180, 780, nullptr, nullptr, instance, nullptr);
     if (g_window == nullptr) {
         cleanupDeviceD3D();
@@ -698,6 +752,11 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
 
     UiState ui;
     Job job;
+
+    if (carver::isElevated()) {
+        ui.drives = carver::listPhysicalDrives();
+        ui.drivesLoaded = true;
+    }
 
     bool running = true;
     while (running) {
