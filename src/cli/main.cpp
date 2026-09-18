@@ -1,6 +1,7 @@
 #include "core/carver.h"
 #include "core/device.h"
 #include "core/device_enum.h"
+#include "core/fat.h"
 #include "core/image.h"
 #include "core/ntfs.h"
 #include "core/partition.h"
@@ -428,7 +429,9 @@ int main(int argc, char** argv) {
     }
 
     carver::NtfsVolumeInfo volume;
+    carver::FatVolumeInfo fatVolume;
     std::vector<uint8_t> bitmap;
+    bool usingNtfs = false;
 
     uint64_t partitionOffset = 0;
     uint64_t partitionSize = device.size();
@@ -437,23 +440,46 @@ int main(int argc, char** argv) {
     const bool needsNtfsBase = freeOnly || mftRecover || !partitionSelection.empty();
 
     if (needsNtfsBase) {
-        carver::PartitionResolution resolution;
-        if (!carver::resolveNtfsBase(device, partitionSelection, resolution, error)) {
-            std::cerr << "error: " << error << "\n";
-            return 1;
+        bool resolvedAtZero = false;
+
+        if (partitionSelection.empty()) {
+            std::vector<uint8_t> probe(512, 0);
+            uint32_t probeGot = 0;
+            std::string probeError;
+            carver::NtfsVolumeInfo probeNtfs;
+            carver::FatVolumeInfo probeFat;
+
+            if (device.readAt(0, probe.data(), static_cast<uint32_t>(probe.size()), probeGot, probeError) &&
+                probeGot == 512) {
+                if (carver::parseNtfsBootSector(probe.data(), probeGot, probeNtfs, probeError) ||
+                    carver::parseFatBootSector(probe.data(), probeGot, probeFat, probeError)) {
+                    partitionOffset = 0;
+                    partitionSize = device.size();
+                    partitionResolved = true;
+                    resolvedAtZero = true;
+                }
+            }
         }
 
-        partitionOffset = resolution.offset;
-        partitionSize = resolution.size;
-        partitionResolved = resolution.found;
-
-        if (resolution.autoSelected) {
-            std::cout << "auto-selected partition " << resolution.index << " ("
-                      << resolution.typeName << ") at offset " << resolution.offset;
-            if (!resolution.label.empty()) {
-                std::cout << "  label \"" << resolution.label << "\"";
+        if (!resolvedAtZero) {
+            carver::PartitionResolution resolution;
+            if (!carver::resolveNtfsBase(device, partitionSelection, resolution, error)) {
+                std::cerr << "error: " << error << "\n";
+                return 1;
             }
-            std::cout << "\n";
+
+            partitionOffset = resolution.offset;
+            partitionSize = resolution.size;
+            partitionResolved = resolution.found;
+
+            if (resolution.autoSelected) {
+                std::cout << "auto-selected partition " << resolution.index << " ("
+                          << resolution.typeName << ") at offset " << resolution.offset;
+                if (!resolution.label.empty()) {
+                    std::cout << "  label \"" << resolution.label << "\"";
+                }
+                std::cout << "\n";
+            }
         }
     }
 
@@ -475,19 +501,40 @@ int main(int argc, char** argv) {
             std::cerr << "error: cannot read the boot sector at offset " << partitionOffset << ": " << error << "\n";
             return 1;
         }
-        if (!carver::parseNtfsBootSector(bootSector.data(), got, volume, error)) {
-            std::cerr << "error: input is not an NTFS volume: " << error << "\n";
-            return 1;
-        }
-        volume.baseOffset = partitionOffset;
-        if (!carver::readBitmap(device, volume, bitmap, error)) {
-            std::cerr << "error: cannot read $Bitmap: " << error << "\n";
-            return 1;
-        }
+        usingNtfs = carver::parseNtfsBootSector(bootSector.data(), got, volume, error);
 
-        std::cout << "filesystem : NTFS, " << volume.bytesPerCluster << " byte clusters\n";
-        std::cout << "clusters   : " << volume.totalClusters() << "\n";
-        std::cout << "bitmap     : " << bitmap.size() << " bytes\n";
+        if (usingNtfs) {
+            volume.baseOffset = partitionOffset;
+            if (!carver::readBitmap(device, volume, bitmap, error)) {
+                std::cerr << "error: cannot read $Bitmap: " << error << "\n";
+                return 1;
+            }
+
+            std::cout << "filesystem : NTFS, " << volume.bytesPerCluster << " byte clusters\n";
+            std::cout << "clusters   : " << volume.totalClusters() << "\n";
+            std::cout << "bitmap     : " << bitmap.size() << " bytes\n";
+        } else if (freeOnly) {
+            std::string fatError;
+            if (!carver::parseFatBootSector(bootSector.data(), got, fatVolume, fatError)) {
+                std::cerr << "error: unrecognised volume.\n";
+                std::cerr << "       not NTFS : " << error << "\n";
+                std::cerr << "       not FAT  : " << fatError << "\n";
+                return 1;
+            }
+
+            fatVolume.baseOffset = partitionOffset;
+            error.clear();
+            std::cout << "filesystem : " << carver::describeFatKind(fatVolume.kind)
+                      << ", " << fatVolume.bytesPerCluster << " byte clusters\n";
+            std::cout << "clusters   : " << fatVolume.clusterCount << "\n";
+            std::cout << "allocation : "
+                      << (fatVolume.kind == carver::FatKind::ExFat ? "exFAT allocation bitmap"
+                                                                   : "FAT table")
+                      << "\n";
+        } else {
+            std::cerr << "error: --mft-recover needs an NTFS volume: " << error << "\n";
+            return 1;
+        }
 
         const uint32_t diskNumber = carver::physicalDiskOfDevicePath(inputPath);
         bool rotational = true;
@@ -550,8 +597,17 @@ int main(int argc, char** argv) {
     }
 
     if (freeOnly) {
-        options.ranges = carver::freeClusterRanges(bitmap, volume.totalClusters(),
-                                                  volume.bytesPerCluster, volume.baseOffset);
+        if (usingNtfs) {
+            options.ranges = carver::freeClusterRanges(bitmap, volume.totalClusters(),
+                                                      volume.bytesPerCluster, volume.baseOffset);
+        } else {
+            std::string fatError;
+            options.ranges = carver::fatFreeRanges(device, fatVolume, fatError);
+            if (!fatError.empty()) {
+                std::cerr << "error: " << fatError << "\n";
+                return 1;
+            }
+        }
 
         uint64_t freeBytes = 0;
         for (const auto& range : options.ranges) {

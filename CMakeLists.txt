@@ -18,6 +18,7 @@ endif()
 add_library(carver_core STATIC
   src/core/device.cpp
   src/core/device_enum.cpp
+  src/core/fat.cpp
   src/core/image.cpp
   src/core/ntfs.cpp
   src/core/partition.cpp
