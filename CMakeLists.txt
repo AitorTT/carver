@@ -36,3 +36,22 @@ target_link_libraries(carver-cli PRIVATE carver_core)
 if(MINGW)
   target_link_options(carver-cli PRIVATE -static)
 endif()
+
+set(IMGUI_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui)
+
+add_executable(carver-gui WIN32
+  src/gui/main.cpp
+  ${IMGUI_DIR}/imgui.cpp
+  ${IMGUI_DIR}/imgui_draw.cpp
+  ${IMGUI_DIR}/imgui_tables.cpp
+  ${IMGUI_DIR}/imgui_widgets.cpp
+  ${IMGUI_DIR}/backends/imgui_impl_win32.cpp
+  ${IMGUI_DIR}/backends/imgui_impl_dx11.cpp
+)
+
+target_include_directories(carver-gui PRIVATE ${IMGUI_DIR} ${IMGUI_DIR}/backends)
+target_link_libraries(carver-gui PRIVATE carver_core d3d11 dxgi d3dcompiler dwmapi comdlg32 ole32 shell32)
+
+if(MINGW)
+  target_link_options(carver-gui PRIVATE -static)
+endif()

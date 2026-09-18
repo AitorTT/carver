@@ -1,0 +1,741 @@
+#include <windows.h>
+#include <commdlg.h>
+#include <d3d11.h>
+#include <dxgi.h>
+#include <shlobj.h>
+
+#include <atomic>
+#include <cstdio>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "imgui.h"
+#include "imgui_impl_dx11.h"
+#include "imgui_impl_win32.h"
+
+#include "core/carver.h"
+#include "core/device.h"
+#include "core/device_enum.h"
+#include "core/ntfs.h"
+#include "core/recover.h"
+#include "core/signature.h"
+
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
+namespace {
+
+ID3D11Device* g_device = nullptr;
+ID3D11DeviceContext* g_context = nullptr;
+IDXGISwapChain* g_swapChain = nullptr;
+ID3D11RenderTargetView* g_renderTarget = nullptr;
+HWND g_window = nullptr;
+bool g_resizePending = false;
+
+enum class SourceKind { PhysicalDrive, ImageFile };
+enum class Mode { CarveWhole, CarveFree, MftRecover };
+
+struct Job {
+    std::mutex mutex;
+    std::thread worker;
+    std::atomic<bool> cancel{false};
+    bool running = false;
+    bool finished = false;
+    std::string error;
+    std::vector<std::string> log;
+
+    carver::Progress progress;
+    uint64_t filesWritten = 0;
+    uint64_t bytesWritten = 0;
+    uint64_t atRisk = 0;
+    uint64_t recordsScanned = 0;
+    uint64_t deletedFound = 0;
+
+    void addLine(const std::string& line) {
+        std::lock_guard<std::mutex> lock(mutex);
+        log.push_back(line);
+        if (log.size() > 500) {
+            log.erase(log.begin(), log.begin() + 100);
+        }
+    }
+};
+
+std::string humanBytes(uint64_t value) {
+    static const char* units[] = {"B", "KiB", "MiB", "GiB", "TiB"};
+    double size = static_cast<double>(value);
+    int unit = 0;
+    while (size >= 1024.0 && unit < 4) {
+        size /= 1024.0;
+        ++unit;
+    }
+    char buffer[64];
+    std::snprintf(buffer, sizeof(buffer), "%.1f %s", size, units[unit]);
+    return buffer;
+}
+
+std::string describeBusType(const std::string& bus) {
+    return bus.empty() ? std::string("unknown") : bus;
+}
+
+bool createDeviceD3D(HWND window) {
+    DXGI_SWAP_CHAIN_DESC description{};
+    description.BufferCount = 2;
+    description.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    description.BufferDesc.RefreshRate.Numerator = 60;
+    description.BufferDesc.RefreshRate.Denominator = 1;
+    description.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
+    description.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    description.OutputWindow = window;
+    description.SampleDesc.Count = 1;
+    description.Windowed = TRUE;
+    description.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+
+    const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0};
+    D3D_FEATURE_LEVEL obtained{};
+
+    const HRESULT result = D3D11CreateDeviceAndSwapChain(
+        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, levels, 2,
+        D3D11_SDK_VERSION, &description, &g_swapChain, &g_device, &obtained, &g_context);
+
+    if (result != S_OK) {
+        return false;
+    }
+
+    ID3D11Texture2D* backBuffer = nullptr;
+    g_swapChain->GetBuffer(0, IID_PPV_ARGS(&backBuffer));
+    if (backBuffer != nullptr) {
+        g_device->CreateRenderTargetView(backBuffer, nullptr, &g_renderTarget);
+        backBuffer->Release();
+    }
+    return true;
+}
+
+void cleanupRenderTarget() {
+    if (g_renderTarget != nullptr) {
+        g_renderTarget->Release();
+        g_renderTarget = nullptr;
+    }
+}
+
+void cleanupDeviceD3D() {
+    cleanupRenderTarget();
+    if (g_swapChain != nullptr) {
+        g_swapChain->Release();
+        g_swapChain = nullptr;
+    }
+    if (g_context != nullptr) {
+        g_context->Release();
+        g_context = nullptr;
+    }
+    if (g_device != nullptr) {
+        g_device->Release();
+        g_device = nullptr;
+    }
+}
+
+void createRenderTarget() {
+    ID3D11Texture2D* backBuffer = nullptr;
+    g_swapChain->GetBuffer(0, IID_PPV_ARGS(&backBuffer));
+    if (backBuffer != nullptr) {
+        g_device->CreateRenderTargetView(backBuffer, nullptr, &g_renderTarget);
+        backBuffer->Release();
+    }
+}
+
+LRESULT WINAPI wndProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    if (ImGui_ImplWin32_WndProcHandler(window, message, wParam, lParam)) {
+        return true;
+    }
+
+    switch (message) {
+    case WM_SIZE:
+        if (wParam != SIZE_MINIMIZED) {
+            g_resizePending = true;
+        }
+        return 0;
+    case WM_SYSCOMMAND:
+        if ((wParam & 0xFFF0) == SC_KEYMENU) {
+            return 0;
+        }
+        break;
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        return 0;
+    default:
+        break;
+    }
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
+std::string browseForFile() {
+    wchar_t path[MAX_PATH] = {};
+    OPENFILENAMEW options{};
+    options.lStructSize = sizeof(options);
+    options.hwndOwner = g_window;
+    options.lpstrFilter = L"Disk images (*.img;*.dd;*.vhd;*.vhdx;*.iso)\0*.img;*.dd;*.vhd;*.vhdx;*.iso\0All files\0*.*\0";
+    options.lpstrFile = path;
+    options.nMaxFile = MAX_PATH;
+    options.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+
+    if (GetOpenFileNameW(&options) == TRUE) {
+        return carver::wideToUtf8(path);
+    }
+    return {};
+}
+
+std::string browseForFolder() {
+    wchar_t path[MAX_PATH] = {};
+    BROWSEINFOW info{};
+    info.hwndOwner = g_window;
+    info.lpszTitle = L"Select the folder that will receive recovered files";
+    info.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+
+    LPITEMIDLIST item = SHBrowseForFolderW(&info);
+    if (item != nullptr) {
+        SHGetPathFromIDListW(item, path);
+        CoTaskMemFree(item);
+        return carver::wideToUtf8(path);
+    }
+    return {};
+}
+
+void logRecoveredFile(Job& job, const std::string& name, uint64_t size, bool risk) {
+    job.addLine("  " + name + "  (" + humanBytes(size) + ")" + (risk ? "  [overwrite risk]" : ""));
+}
+
+void runJob(Job& job,
+            const std::string& sourcePath,
+            const std::string& outputDirectory,
+            Mode mode) {
+    job.running = true;
+    job.finished = false;
+    job.error.clear();
+    job.progress = carver::Progress{};
+    job.filesWritten = 0;
+    job.bytesWritten = 0;
+    job.atRisk = 0;
+    job.recordsScanned = 0;
+    job.deletedFound = 0;
+
+    carver::RawDevice device;
+    std::string error;
+
+    job.addLine("opening " + sourcePath);
+    if (!device.open(carver::utf8ToWide(sourcePath), error)) {
+        job.addLine("error: " + error);
+        job.error = error;
+        job.running = false;
+        job.finished = true;
+        return;
+    }
+
+    job.addLine("size  : " + humanBytes(device.size()));
+    job.addLine("sector: " + std::to_string(device.sectorSize()) + " bytes");
+    job.addLine("output: " + outputDirectory);
+
+    const auto onProgress = [&job](const carver::Progress& state) {
+        std::lock_guard<std::mutex> lock(job.mutex);
+        job.progress = state;
+        return !job.cancel.load();
+    };
+
+    if (mode == Mode::MftRecover) {
+        carver::NtfsVolumeInfo volume;
+        std::vector<uint8_t> bootSector(512, 0);
+        uint32_t got = 0;
+
+        if (!device.readAt(0, bootSector.data(), 512, got, error) || got < 512) {
+            job.error = "cannot read boot sector: " + error;
+        } else if (!carver::parseNtfsBootSector(bootSector.data(), got, volume, error)) {
+            job.error = "not an NTFS volume: " + error;
+        }
+
+        std::vector<uint8_t> bitmap;
+        if (job.error.empty() && !carver::readBitmap(device, volume, bitmap, error)) {
+            job.error = "cannot read the cluster bitmap: " + error;
+        }
+
+        if (job.error.empty()) {
+            job.addLine("filesystem: NTFS, " + std::to_string(volume.bytesPerCluster) + " byte clusters");
+
+            carver::RecoverOptions options;
+            std::vector<carver::RecoveredFile> index;
+
+            const carver::RecoverResult result = carver::recoverDeletedFiles(
+                device, volume, bitmap, outputDirectory, options, onProgress, index, error);
+
+            if (!error.empty()) {
+                job.error = error;
+            }
+
+            job.recordsScanned = result.recordsScanned;
+            job.deletedFound = result.deletedFound;
+            job.filesWritten = result.filesWritten;
+            job.bytesWritten = result.bytesWritten;
+            job.atRisk = result.atRisk;
+
+            for (const auto& file : index) {
+                logRecoveredFile(job, file.originalName + "  ->  " + file.outputName, file.size, file.overwriteRisk);
+            }
+        }
+    } else {
+        carver::CarveOptions options;
+
+        if (mode == Mode::CarveFree) {
+            carver::NtfsVolumeInfo volume;
+            std::vector<uint8_t> bootSector(512, 0);
+            uint32_t got = 0;
+
+            if (!device.readAt(0, bootSector.data(), 512, got, error) || got < 512) {
+                job.error = "cannot read boot sector: " + error;
+            } else if (!carver::parseNtfsBootSector(bootSector.data(), got, volume, error)) {
+                job.error = "not an NTFS volume: " + error;
+            }
+
+            std::vector<uint8_t> bitmap;
+            if (job.error.empty() && !carver::readBitmap(device, volume, bitmap, error)) {
+                job.error = "cannot read the cluster bitmap: " + error;
+            }
+
+            if (job.error.empty()) {
+                options.ranges = carver::freeClusterRanges(bitmap, volume.totalClusters(), volume.bytesPerCluster);
+                job.addLine("unallocated extents: " + std::to_string(options.ranges.size()));
+                if (options.ranges.empty()) {
+                    job.error = "no unallocated clusters found";
+                }
+            }
+        }
+
+        if (job.error.empty()) {
+            const auto& signatures = carver::defaultSignatures();
+            const carver::CarveResult result =
+                carver::carveDevice(device, outputDirectory, signatures, options, onProgress, error);
+
+            if (!error.empty()) {
+                job.error = error;
+            }
+            job.filesWritten = result.filesRecovered;
+            job.bytesWritten = result.bytesRecovered;
+        }
+    }
+
+    if (job.cancel.load()) {
+        job.addLine("cancelled");
+    } else if (!job.error.empty()) {
+        job.addLine("error: " + job.error);
+    } else {
+        job.addLine("done: " + std::to_string(job.filesWritten) + " files, " + humanBytes(job.bytesWritten));
+    }
+
+    job.running = false;
+    job.finished = true;
+}
+
+struct UiState {
+    SourceKind source = SourceKind::ImageFile;
+    Mode mode = Mode::MftRecover;
+    int selectedDrive = -1;
+    char imagePath[512] = {};
+    char outputPath[512] = {};
+    std::vector<carver::DriveInfo> drives;
+    bool drivesLoaded = false;
+    bool autoScroll = true;
+};
+
+void buildUi(UiState& ui, Job& job) {
+    const bool busy = job.running;
+
+    if (!carver::isElevated()) {
+        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f),
+                           "Not elevated: physical drives cannot be opened. Restart as administrator.");
+        ImGui::Separator();
+    }
+
+    ImGui::BeginChild("left", ImVec2(400, 0), ImGuiChildFlags_Borders);
+
+    ImGui::TextUnformatted("Source");
+    ImGui::Separator();
+
+    if (ImGui::RadioButton("Disk image file", ui.source == SourceKind::ImageFile)) {
+        ui.source = SourceKind::ImageFile;
+    }
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Physical drive", ui.source == SourceKind::PhysicalDrive)) {
+        ui.source = SourceKind::PhysicalDrive;
+    }
+
+    ImGui::Spacing();
+
+    if (ui.source == SourceKind::ImageFile) {
+        ImGui::BeginDisabled(busy);
+        ImGui::SetNextItemWidth(-90);
+        ImGui::InputText("##image", ui.imagePath, sizeof(ui.imagePath));
+        ImGui::SameLine();
+        if (ImGui::Button("Browse...", ImVec2(80, 0))) {
+            const std::string picked = browseForFile();
+            if (!picked.empty()) {
+                std::snprintf(ui.imagePath, sizeof(ui.imagePath), "%s", picked.c_str());
+            }
+        }
+        ImGui::EndDisabled();
+    } else {
+        if (ImGui::Button("Refresh drive list")) {
+            ui.drives = carver::listPhysicalDrives();
+            ui.drivesLoaded = true;
+        }
+        if (ui.drives.empty()) {
+            ImGui::TextDisabled(ui.drivesLoaded ? "no drives available" : "click refresh to enumerate drives");
+        }
+        for (int index = 0; index < static_cast<int>(ui.drives.size()); ++index) {
+            const auto& drive = ui.drives[index];
+            char label[256];
+            std::snprintf(label, sizeof(label), "%s  |  %s  |  %s", drive.devicePath.c_str(),
+                          humanBytes(drive.size).c_str(), describeBusType(drive.busType).c_str());
+            if (ImGui::Selectable(label, ui.selectedDrive == index)) {
+                ui.selectedDrive = index;
+            }
+            if (!drive.model.empty()) {
+                ImGui::TextDisabled("    %s%s", drive.model.c_str(), drive.removable ? "  [removable]" : "");
+            }
+        }
+    }
+
+    ImGui::Spacing();
+    ImGui::TextUnformatted("Output folder");
+    ImGui::Separator();
+    ImGui::BeginDisabled(busy);
+    ImGui::SetNextItemWidth(-90);
+    ImGui::InputText("##output", ui.outputPath, sizeof(ui.outputPath));
+    ImGui::SameLine();
+    if (ImGui::Button("Browse...", ImVec2(80, 0))) {
+        const std::string picked = browseForFolder();
+        if (!picked.empty()) {
+            std::snprintf(ui.outputPath, sizeof(ui.outputPath), "%s", picked.c_str());
+        }
+    }
+    ImGui::EndDisabled();
+
+    ImGui::Spacing();
+    ImGui::TextUnformatted("Mode");
+    ImGui::Separator();
+    ImGui::BeginDisabled(busy);
+    if (ImGui::RadioButton("Recover deleted files by name (NTFS)", ui.mode == Mode::MftRecover)) {
+        ui.mode = Mode::MftRecover;
+    }
+    if (ImGui::RadioButton("Carve signatures from unallocated space (NTFS)", ui.mode == Mode::CarveFree)) {
+        ui.mode = Mode::CarveFree;
+    }
+    if (ImGui::RadioButton("Carve signatures from the whole source", ui.mode == Mode::CarveWhole)) {
+        ui.mode = Mode::CarveWhole;
+    }
+    ImGui::EndDisabled();
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    std::string resolvedSource;
+    if (ui.source == SourceKind::PhysicalDrive) {
+        if (ui.selectedDrive >= 0 && ui.selectedDrive < static_cast<int>(ui.drives.size())) {
+            resolvedSource = ui.drives[ui.selectedDrive].devicePath;
+        }
+    } else {
+        resolvedSource = ui.imagePath;
+    }
+
+    const bool canStart = !busy && !resolvedSource.empty() && ui.outputPath[0] != '\0';
+
+    if (busy) {
+        if (ImGui::Button("Stop", ImVec2(120, 32))) {
+            job.cancel.store(true);
+        }
+    } else {
+        ImGui::BeginDisabled(!canStart);
+        if (ImGui::Button("Start scan", ImVec2(120, 32))) {
+            if (job.worker.joinable()) {
+                job.worker.join();
+            }
+            job.cancel.store(false);
+            const std::string source = resolvedSource;
+            const std::string output = ui.outputPath;
+            const Mode mode = ui.mode;
+            job.worker = std::thread([&job, source, output, mode] {
+                runJob(job, source, output, mode);
+            });
+        }
+        ImGui::EndDisabled();
+        if (!canStart) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("choose a source and an output folder");
+        }
+    }
+
+    ImGui::EndChild();
+
+    ImGui::SameLine();
+
+    ImGui::BeginChild("right", ImVec2(0, 0), ImGuiChildFlags_Borders);
+
+    carver::Progress snapshot;
+    std::vector<std::string> lines;
+    bool finished = false;
+    {
+        std::lock_guard<std::mutex> lock(job.mutex);
+        snapshot = job.progress;
+        lines = job.log;
+        finished = job.finished;
+    }
+
+    const double fraction = snapshot.bytesTotal == 0
+                                ? (finished ? 1.0 : 0.0)
+                                : static_cast<double>(snapshot.bytesScanned) / static_cast<double>(snapshot.bytesTotal);
+
+    char overlay[128];
+    std::snprintf(overlay, sizeof(overlay), "%.1f%%  (%.1f MiB of %.1f MiB)",
+                  fraction * 100.0,
+                  static_cast<double>(snapshot.bytesScanned) / (1024.0 * 1024.0),
+                  static_cast<double>(snapshot.bytesTotal) / (1024.0 * 1024.0));
+    ImGui::ProgressBar(static_cast<float>(fraction), ImVec2(-1, 22), overlay);
+
+    ImGui::Text("files: %llu      written: %s      unallocated extents scanned as bytes: %s",
+                static_cast<unsigned long long>(job.filesWritten),
+                humanBytes(job.bytesWritten).c_str(),
+                humanBytes(snapshot.bytesScanned).c_str());
+
+    if (job.recordsScanned > 0) {
+        ImGui::Text("mft records: %llu      deleted entries: %llu      possibly overwritten: %llu",
+                    static_cast<unsigned long long>(job.recordsScanned),
+                    static_cast<unsigned long long>(job.deletedFound),
+                    static_cast<unsigned long long>(job.atRisk));
+    }
+
+    if (!job.error.empty()) {
+        ImGui::TextColored(ImVec4(0.95f, 0.35f, 0.35f, 1.0f), "error: %s", job.error.c_str());
+    }
+
+    ImGui::Separator();
+    ImGui::Checkbox("auto-scroll log", &ui.autoScroll);
+    ImGui::BeginChild("log", ImVec2(0, 0), ImGuiChildFlags_Borders, ImGuiWindowFlags_HorizontalScrollbar);
+    for (const auto& line : lines) {
+        ImGui::TextUnformatted(line.c_str());
+    }
+    if (ui.autoScroll && ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 1.0f) {
+        ImGui::SetScrollHereY(1.0f);
+    }
+    ImGui::EndChild();
+
+    ImGui::EndChild();
+}
+
+int runSelfTest(const std::string& logPath) {
+    std::string report;
+    int status = 0;
+
+    const HINSTANCE instance = GetModuleHandleW(nullptr);
+    const wchar_t* className = L"carverSelfTest";
+
+    WNDCLASSEXW windowClass{};
+    windowClass.cbSize = sizeof(windowClass);
+    windowClass.lpfnWndProc = wndProc;
+    windowClass.hInstance = instance;
+    windowClass.lpszClassName = className;
+    RegisterClassExW(&windowClass);
+
+    g_window = CreateWindowExW(0, className, L"carver selftest", WS_OVERLAPPEDWINDOW,
+                               0, 0, 1280, 800, nullptr, nullptr, instance, nullptr);
+
+    if (g_window == nullptr) {
+        report = "FAIL create window\n";
+        status = 1;
+    } else if (!createDeviceD3D(g_window)) {
+        report = "FAIL create D3D11 device and swap chain\n";
+        status = 1;
+    } else {
+        ShowWindow(g_window, SW_HIDE);
+
+        IMGUI_CHECKVERSION();
+        ImGui::CreateContext();
+        ImGui::GetIO().IniFilename = nullptr;
+        ImGui_ImplWin32_Init(g_window);
+        ImGui_ImplDX11_Init(g_device, g_context);
+
+        report += "imgui version : " + std::string(IMGUI_VERSION) + "\n";
+        report += "d3d device    : ok\n";
+        report += "backends      : win32 + dx11 ok\n";
+
+        int framesRendered = 0;
+        for (int frame = 0; frame < 3; ++frame) {
+            ImGui_ImplDX11_NewFrame();
+            ImGui_ImplWin32_NewFrame();
+            ImGui::NewFrame();
+
+            ImGui::Begin("selftest");
+            ImGui::Text("frame %d", frame);
+            ImGui::ProgressBar(0.5f, ImVec2(-1, 20));
+            ImGui::End();
+
+            ImGui::Render();
+
+            const float clear[4] = {0.1f, 0.1f, 0.12f, 1.0f};
+            g_context->OMSetRenderTargets(1, &g_renderTarget, nullptr);
+            g_context->ClearRenderTargetView(g_renderTarget, clear);
+            ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+            g_swapChain->Present(1, 0);
+
+            if (ImGui::GetDrawData() != nullptr && ImGui::GetDrawData()->Valid) {
+                ++framesRendered;
+            }
+        }
+
+        report += "frames drawn  : " + std::to_string(framesRendered) + " of 3\n";
+
+        ImGui_ImplDX11_Shutdown();
+        ImGui_ImplWin32_Shutdown();
+        ImGui::DestroyContext();
+
+        if (framesRendered != 3) {
+            report += "FAIL: not all frames produced valid draw data\n";
+            status = 1;
+        } else {
+            report += "RESULT: PASS\n";
+        }
+    }
+
+    if (status != 0 && report.find("RESULT") == std::string::npos) {
+        report += "RESULT: FAIL\n";
+    }
+
+    cleanupDeviceD3D();
+    if (g_window != nullptr) {
+        DestroyWindow(g_window);
+    }
+    UnregisterClassW(className, instance);
+
+    FILE* file = nullptr;
+    if (fopen_s(&file, logPath.c_str(), "w") == 0 && file != nullptr) {
+        fwrite(report.data(), 1, report.size(), file);
+        fclose(file);
+    }
+
+    return status;
+}
+
+}
+
+int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
+    const std::string selftestFlag = "--selftest";
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+
+    std::string logPath = "carver-gui-selftest.log";
+    bool selfTest = false;
+    for (int index = 1; index < argc; ++index) {
+        const std::string argument = carver::wideToUtf8(argv[index]);
+        if (argument == selftestFlag) {
+            selfTest = true;
+        } else if (index > 0) {
+            logPath = argument;
+        }
+    }
+    if (argv != nullptr) {
+        LocalFree(argv);
+    }
+
+    if (selfTest) {
+        return runSelfTest(logPath);
+    }
+
+    const wchar_t* className = L"carverWindowClass";
+    WNDCLASSEXW windowClass{};
+    windowClass.cbSize = sizeof(windowClass);
+    windowClass.style = CS_CLASSDC;
+    windowClass.lpfnWndProc = wndProc;
+    windowClass.hInstance = instance;
+    windowClass.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    windowClass.lpszClassName = className;
+    RegisterClassExW(&windowClass);
+
+    g_window = CreateWindowExW(0, className, L"carver - file recovery", WS_OVERLAPPEDWINDOW,
+                               100, 100, 1180, 780, nullptr, nullptr, instance, nullptr);
+    if (g_window == nullptr) {
+        cleanupDeviceD3D();
+        UnregisterClassW(className, instance);
+        return 1;
+    }
+
+    if (!createDeviceD3D(g_window)) {
+        cleanupDeviceD3D();
+        DestroyWindow(g_window);
+        UnregisterClassW(className, instance);
+        return 1;
+    }
+
+    ShowWindow(g_window, SW_SHOWDEFAULT);
+    UpdateWindow(g_window);
+
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGui::GetIO().IniFilename = nullptr;
+    ImGui::StyleColorsDark();
+    ImGui_ImplWin32_Init(g_window);
+    ImGui_ImplDX11_Init(g_device, g_context);
+
+    UiState ui;
+    Job job;
+
+    bool running = true;
+    while (running) {
+        MSG message;
+        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+            if (message.message == WM_QUIT) {
+                running = false;
+            }
+        }
+        if (!running) {
+            break;
+        }
+
+        if (g_resizePending) {
+            cleanupRenderTarget();
+            g_swapChain->ResizeBuffers(0, 0, 0, DXGI_FORMAT_UNKNOWN, 0);
+            createRenderTarget();
+            g_resizePending = false;
+        }
+
+        ImGui_ImplDX11_NewFrame();
+        ImGui_ImplWin32_NewFrame();
+        ImGui::NewFrame();
+
+        ImGui::SetNextWindowPos(ImVec2(0, 0));
+        ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
+        ImGui::Begin("carver", nullptr,
+                     ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoResize |
+                     ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBringToFrontOnFocus);
+        buildUi(ui, job);
+        ImGui::End();
+
+        ImGui::Render();
+
+        const float clear[4] = {0.09f, 0.09f, 0.11f, 1.0f};
+        g_context->OMSetRenderTargets(1, &g_renderTarget, nullptr);
+        g_context->ClearRenderTargetView(g_renderTarget, clear);
+        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+        g_swapChain->Present(1, 0);
+    }
+
+    job.cancel.store(true);
+    if (job.worker.joinable()) {
+        job.worker.join();
+    }
+
+    ImGui_ImplDX11_Shutdown();
+    ImGui_ImplWin32_Shutdown();
+    ImGui::DestroyContext();
+    cleanupDeviceD3D();
+    DestroyWindow(g_window);
+    UnregisterClassW(className, instance);
+    return 0;
+}
