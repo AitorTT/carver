@@ -165,18 +165,153 @@ bool readExtents(RawDevice& device, const NtfsVolumeInfo& info, const std::vecto
     return true;
 }
 
+void applyStandardInformation(const std::vector<uint8_t>& record, size_t position, MftFileEntry& entry) {
+    const uint32_t contentSize = readU32(record.data() + position + 0x10);
+    const uint16_t contentOffset = readU16(record.data() + position + 0x14);
+    const size_t start = position + contentOffset;
+    if (contentSize < 0x20 || start + 0x20 > record.size()) {
+        return;
+    }
+
+    entry.standard.created = readU64(record.data() + start + 0x00);
+    entry.standard.modified = readU64(record.data() + start + 0x08);
+    entry.standard.mftModified = readU64(record.data() + start + 0x10);
+    entry.standard.accessed = readU64(record.data() + start + 0x18);
+}
+
+void applyFileNameAttribute(const std::vector<uint8_t>& record, size_t position, MftFileEntry& entry) {
+    const uint32_t contentSize = readU32(record.data() + position + 0x10);
+    const uint16_t contentOffset = readU16(record.data() + position + 0x14);
+    const size_t start = position + contentOffset;
+    if (contentSize < 0x42 || start + 0x42 > record.size()) {
+        return;
+    }
+
+    const uint8_t characterCount = record[start + 0x40];
+    const uint8_t nameSpace = record[start + 0x41];
+    if (characterCount == 0 || start + 0x42 + static_cast<size_t>(characterCount) * 2 > record.size()) {
+        return;
+    }
+
+    const bool haveName = !entry.name.empty();
+    const bool currentIsDos = haveName && entry.nameNamespace == 2;
+    const bool candidateIsDos = nameSpace == 2;
+    if (!haveName || (currentIsDos && !candidateIsDos)) {
+        entry.name = utf16leToUtf8(record.data() + start + 0x42, characterCount);
+        entry.nameNamespace = nameSpace;
+        entry.parentRecord = readU64(record.data() + start + 0x00) & 0x0000FFFFFFFFFFFFull;
+        entry.fileName.created = readU64(record.data() + start + 0x08);
+        entry.fileName.modified = readU64(record.data() + start + 0x10);
+        entry.fileName.mftModified = readU64(record.data() + start + 0x18);
+        entry.fileName.accessed = readU64(record.data() + start + 0x20);
+        entry.allocatedSize = readU64(record.data() + start + 0x28);
+        entry.logicalSize = readU64(record.data() + start + 0x30);
+    }
+}
+
+void applyDataAttribute(const std::vector<uint8_t>& record, size_t position, uint32_t attributeLength,
+                        MftFileEntry& entry) {
+    entry.hasData = true;
+
+    const uint8_t nonResident = record[position + 0x08];
+    if (nonResident == 0) {
+        entry.residentData = true;
+        const uint32_t contentSize = readU32(record.data() + position + 0x10);
+        const uint16_t contentOffset = readU16(record.data() + position + 0x14);
+        const size_t start = position + contentOffset;
+        if (start + contentSize <= record.size()) {
+            entry.residentContent.assign(record.begin() + start, record.begin() + start + contentSize);
+            entry.logicalSize = contentSize;
+        }
+        return;
+    }
+
+    DataExtent extent;
+    extent.startingVcn = readU64(record.data() + position + 0x10);
+    extent.lastVcn = readU64(record.data() + position + 0x18);
+    extent.realSize = readU64(record.data() + position + 0x30);
+
+    const uint16_t runListOffset = readU16(record.data() + position + 0x20);
+    const size_t runListStart = position + runListOffset;
+    if (runListStart < position + attributeLength) {
+        std::string ignored;
+        decodeRunList(record.data() + runListStart, position + attributeLength - runListStart,
+                      extent.runs, ignored);
+    }
+
+    entry.dataExtents.push_back(std::move(extent));
+}
+
+void parseAttributeListContent(const std::vector<uint8_t>& record, size_t position, MftFileEntry& entry) {
+    const uint32_t contentSize = readU32(record.data() + position + 0x10);
+    const uint16_t contentOffset = readU16(record.data() + position + 0x14);
+    const size_t start = position + contentOffset;
+    if (start + contentSize > record.size()) {
+        return;
+    }
+
+    const size_t end = start + contentSize;
+    size_t cursor = start;
+    while (cursor + 0x1A <= end) {
+        const uint32_t type = readU32(record.data() + cursor);
+        if (type == ATTRIBUTE_END) {
+            break;
+        }
+
+        const uint16_t entryLength = readU16(record.data() + cursor + 0x04);
+        if (entryLength < 0x1A || cursor + entryLength > end) {
+            break;
+        }
+
+        AttributeListEntry item;
+        item.type = type;
+        item.startingVcn = readU64(record.data() + cursor + 0x08);
+        item.baseRecord = readU64(record.data() + cursor + 0x10) & 0x0000FFFFFFFFFFFFull;
+        item.attributeId = readU16(record.data() + cursor + 0x18);
+        entry.attributeList.push_back(item);
+
+        cursor += entryLength;
+    }
+}
+
+void buildDataRuns(MftFileEntry& entry) {
+    entry.runs.clear();
+    if (entry.dataExtents.empty()) {
+        return;
+    }
+
+    std::stable_sort(entry.dataExtents.begin(), entry.dataExtents.end(),
+                     [](const DataExtent& left, const DataExtent& right) {
+                         return left.startingVcn < right.startingVcn;
+                     });
+
+    uint64_t realSize = 0;
+    for (const auto& extent : entry.dataExtents) {
+        entry.runs.insert(entry.runs.end(), extent.runs.begin(), extent.runs.end());
+        if (extent.startingVcn == 0 && extent.realSize > 0) {
+            realSize = extent.realSize;
+        } else if (extent.realSize > realSize) {
+            realSize = extent.realSize;
+        }
+    }
+
+    if (realSize > 0) {
+        entry.logicalSize = realSize;
+    }
+}
+
 bool parseMftEntryAttributes(const std::vector<uint8_t>& record, MftFileEntry& entry) {
     if (record.size() < 0x30 || std::memcmp(record.data(), "FILE", 4) != 0) {
         return false;
     }
 
     entry.sequence = readU16(record.data() + 0x10);
+    entry.baseRecordReference = readU64(record.data() + 0x20) & 0x0000FFFFFFFFFFFFull;
     const uint16_t flags = readU16(record.data() + 0x16);
     entry.inUse = (flags & 0x0001) != 0;
     entry.directory = (flags & 0x0002) != 0;
 
     size_t position = readU16(record.data() + 0x14);
-    bool haveName = false;
 
     while (position + 8 <= record.size()) {
         const uint32_t type = readU32(record.data() + position);
@@ -193,72 +328,22 @@ bool parseMftEntryAttributes(const std::vector<uint8_t>& record, MftFileEntry& e
         const uint8_t nameLength = record[position + 0x09];
 
         if (type == ATTRIBUTE_STANDARD_INFORMATION && nonResident == 0 && nameLength == 0) {
-            const uint32_t contentSize = readU32(record.data() + position + 0x10);
-            const uint16_t contentOffset = readU16(record.data() + position + 0x14);
-            const size_t start = position + contentOffset;
-            if (contentSize >= 0x20 && start + 0x20 <= record.size()) {
-                entry.standard.created = readU64(record.data() + start + 0x00);
-                entry.standard.modified = readU64(record.data() + start + 0x08);
-                entry.standard.mftModified = readU64(record.data() + start + 0x10);
-                entry.standard.accessed = readU64(record.data() + start + 0x18);
-            }
+            applyStandardInformation(record, position, entry);
         } else if (type == ATTRIBUTE_ATTRIBUTE_LIST) {
             entry.hasAttributeList = true;
-        } else if (type == ATTRIBUTE_FILE_NAME && nonResident == 0) {
-            const uint32_t contentSize = readU32(record.data() + position + 0x10);
-            const uint16_t contentOffset = readU16(record.data() + position + 0x14);
-            const size_t start = position + contentOffset;
-            if (contentSize >= 0x42 && start + 0x42 <= record.size()) {
-                const uint8_t characterCount = record[start + 0x40];
-                const uint8_t nameSpace = record[start + 0x41];
-                if (characterCount > 0 &&
-                    start + 0x42 + static_cast<size_t>(characterCount) * 2 <= record.size()) {
-                    const bool currentIsDos = haveName && entry.nameNamespace == 2;
-                    const bool candidateIsDos = nameSpace == 2;
-                    if (!haveName || (currentIsDos && !candidateIsDos)) {
-                        entry.name = utf16leToUtf8(record.data() + start + 0x42, characterCount);
-                        entry.nameNamespace = nameSpace;
-                        entry.parentRecord = readU64(record.data() + start + 0x00) & 0x0000FFFFFFFFFFFFull;
-                        entry.fileName.created = readU64(record.data() + start + 0x08);
-                        entry.fileName.modified = readU64(record.data() + start + 0x10);
-                        entry.fileName.mftModified = readU64(record.data() + start + 0x18);
-                        entry.fileName.accessed = readU64(record.data() + start + 0x20);
-                        entry.allocatedSize = readU64(record.data() + start + 0x28);
-                        entry.logicalSize = readU64(record.data() + start + 0x30);
-                        haveName = true;
-                    }
-                }
-            }
-        } else if (type == ATTRIBUTE_DATA && nameLength == 0) {
-            entry.hasData = true;
             if (nonResident == 0) {
-                entry.residentData = true;
-                const uint32_t contentSize = readU32(record.data() + position + 0x10);
-                const uint16_t contentOffset = readU16(record.data() + position + 0x14);
-                const size_t start = position + contentOffset;
-                if (start + contentSize <= record.size()) {
-                    entry.residentContent.assign(record.begin() + start, record.begin() + start + contentSize);
-                    entry.logicalSize = contentSize;
-                }
-            } else {
-                const uint16_t runListOffset = readU16(record.data() + position + 0x20);
-                const uint64_t realSize = readU64(record.data() + position + 0x30);
-                const size_t runListStart = position + runListOffset;
-                if (runListStart < position + attributeLength) {
-                    std::string ignored;
-                    entry.runs.clear();
-                    decodeRunList(record.data() + runListStart, position + attributeLength - runListStart,
-                                  entry.runs, ignored);
-                }
-                if (realSize > 0) {
-                    entry.logicalSize = realSize;
-                }
+                parseAttributeListContent(record, position, entry);
             }
+        } else if (type == ATTRIBUTE_FILE_NAME && nonResident == 0) {
+            applyFileNameAttribute(record, position, entry);
+        } else if (type == ATTRIBUTE_DATA && nameLength == 0) {
+            applyDataAttribute(record, position, attributeLength, entry);
         }
 
         position += attributeLength;
     }
 
+    buildDataRuns(entry);
     return true;
 }
 
@@ -424,6 +509,70 @@ bool readMftEntry(RawDevice& device, const NtfsVolumeInfo& info, uint64_t record
     return true;
 }
 
+bool readMftEntryFull(RawDevice& device, const NtfsVolumeInfo& info, uint64_t recordNumber,
+                      MftFileEntry& entry, std::string& error) {
+    if (!readMftEntry(device, info, recordNumber, entry, error)) {
+        return false;
+    }
+
+    if (entry.attributeList.empty()) {
+        entry.attributeListFollowed = true;
+        return true;
+    }
+
+    std::vector<uint8_t> externalRecord;
+    std::string ignored;
+    uint64_t cachedRecord = ~0ull;
+
+    for (const auto& item : entry.attributeList) {
+        if (item.baseRecord == recordNumber) {
+            continue;
+        }
+        if (item.type != ATTRIBUTE_FILE_NAME && item.type != ATTRIBUTE_DATA) {
+            continue;
+        }
+
+        if (item.baseRecord != cachedRecord) {
+            if (!readMftRecord(device, info, item.baseRecord, externalRecord, ignored)) {
+                continue;
+            }
+            cachedRecord = item.baseRecord;
+        }
+
+        size_t position = readU16(externalRecord.data() + 0x14);
+        while (position + 8 <= externalRecord.size()) {
+            const uint32_t type = readU32(externalRecord.data() + position);
+            if (type == ATTRIBUTE_END) {
+                break;
+            }
+
+            const uint32_t attributeLength = readU32(externalRecord.data() + position + 4);
+            if (attributeLength < 16 || position + attributeLength > externalRecord.size()) {
+                break;
+            }
+
+            const uint8_t nonResident = externalRecord[position + 0x08];
+            const uint8_t nameLength = externalRecord[position + 0x09];
+            const uint16_t attributeId = readU16(externalRecord.data() + position + 0x0E);
+
+            if (type == item.type && attributeId == item.attributeId) {
+                if (type == ATTRIBUTE_FILE_NAME && nonResident == 0) {
+                    applyFileNameAttribute(externalRecord, position, entry);
+                } else if (type == ATTRIBUTE_DATA && nameLength == 0) {
+                    applyDataAttribute(externalRecord, position, attributeLength, entry);
+                }
+                break;
+            }
+
+            position += attributeLength;
+        }
+    }
+
+    entry.attributeListFollowed = true;
+    buildDataRuns(entry);
+    return true;
+}
+
 bool getMftRecordCount(RawDevice& device, const NtfsVolumeInfo& info, uint64_t& count, std::string& error) {
     MftFileEntry mft;
     if (!readMftEntry(device, info, 0, mft, error)) {
@@ -449,7 +598,7 @@ bool readFileRecordData(RawDevice& device, const NtfsVolumeInfo& info, uint64_t 
     data.clear();
 
     MftFileEntry entry;
-    if (!readMftEntry(device, info, recordNumber, entry, error)) {
+    if (!readMftEntryFull(device, info, recordNumber, entry, error)) {
         return false;
     }
 

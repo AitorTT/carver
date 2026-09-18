@@ -246,8 +246,9 @@ RecoverResult recoverDeletedFiles(RawDevice& device,
         MftFileEntry entry;
         std::string ignored;
 
-        if (readMftEntry(device, info, recordNumber, entry, ignored)) {
+        if (readMftEntryFull(device, info, recordNumber, entry, ignored)) {
             const bool eligible = !entry.inUse &&
+                                  entry.baseRecordReference == 0 &&
                                   (options.includeDirectories || !entry.directory) &&
                                   entry.hasData &&
                                   !entry.name.empty() &&

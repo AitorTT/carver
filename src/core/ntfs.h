@@ -28,6 +28,20 @@ struct DataRun {
     bool sparse = false;
 };
 
+struct DataExtent {
+    uint64_t startingVcn = 0;
+    uint64_t lastVcn = 0;
+    uint64_t realSize = 0;
+    std::vector<DataRun> runs;
+};
+
+struct AttributeListEntry {
+    uint32_t type = 0;
+    uint64_t startingVcn = 0;
+    uint64_t baseRecord = 0;
+    uint16_t attributeId = 0;
+};
+
 struct NtfsTimestamps {
     uint64_t created = 0;
     uint64_t modified = 0;
@@ -37,6 +51,7 @@ struct NtfsTimestamps {
 
 struct MftFileEntry {
     uint64_t recordNumber = 0;
+    uint64_t baseRecordReference = 0;
     uint16_t sequence = 0;
     bool inUse = false;
     bool directory = false;
@@ -47,6 +62,9 @@ struct MftFileEntry {
     uint64_t allocatedSize = 0;
     std::vector<uint8_t> residentContent;
     std::vector<DataRun> runs;
+    std::vector<DataExtent> dataExtents;
+    std::vector<AttributeListEntry> attributeList;
+    bool attributeListFollowed = false;
     std::string name;
     uint8_t nameNamespace = 0;
     uint64_t parentRecord = 0;
@@ -60,6 +78,9 @@ bool decodeRunList(const uint8_t* data, size_t length, std::vector<DataRun>& run
 
 bool readMftEntry(RawDevice& device, const NtfsVolumeInfo& info, uint64_t recordNumber,
                   MftFileEntry& entry, std::string& error);
+
+bool readMftEntryFull(RawDevice& device, const NtfsVolumeInfo& info, uint64_t recordNumber,
+                      MftFileEntry& entry, std::string& error);
 
 bool getMftRecordCount(RawDevice& device, const NtfsVolumeInfo& info, uint64_t& count, std::string& error);
 

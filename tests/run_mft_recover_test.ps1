@@ -190,7 +190,7 @@ function New-MftRecord {
     Set-U16 $record 510 $usn
     Set-U16 $record 1022 $usn
 
-    return $record
+    return ,$record
 }
 
 if (Test-Path -LiteralPath $WorkDir) { Remove-Item -LiteralPath $WorkDir -Recurse -Force }
