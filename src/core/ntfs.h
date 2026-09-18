@@ -92,6 +92,12 @@ std::string fileTimeToString(uint64_t fileTime);
 bool readFileRecordData(RawDevice& device, const NtfsVolumeInfo& info, uint64_t recordNumber,
                         std::vector<uint8_t>& data, std::string& error);
 
+bool readAttributeData(RawDevice& device, const NtfsVolumeInfo& info, uint64_t recordNumber,
+                       uint32_t attributeType, const std::string& attributeName,
+                       std::vector<uint8_t>& data, std::string& error);
+
+void applyUpdateSequence(std::vector<uint8_t>& buffer, uint32_t bytesPerSector);
+
 bool readBitmap(RawDevice& device, const NtfsVolumeInfo& info, std::vector<uint8_t>& bitmap, std::string& error);
 
 std::vector<ByteRange> freeClusterRanges(const std::vector<uint8_t>& bitmap, uint64_t totalClusters,

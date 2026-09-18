@@ -64,13 +64,13 @@ void applyFixups(std::vector<uint8_t>& record, uint32_t bytesPerSector) {
     }
 
     for (uint16_t index = 1; index < fixupCount; ++index) {
-        const size_t sectorEnd = static_cast<size_t>(index) * bytesPerSector;
+        const size_t sectorTail = static_cast<size_t>(index) * bytesPerSector - 2;
         const size_t replacement = static_cast<size_t>(fixupOffset) + static_cast<size_t>(index) * 2;
-        if (sectorEnd + 2 > record.size() || replacement + 2 > record.size()) {
+        if (sectorTail + 2 > record.size() || replacement + 2 > record.size()) {
             return;
         }
-        record[sectorEnd] = record[replacement];
-        record[sectorEnd + 1] = record[replacement + 1];
+        record[sectorTail] = record[replacement];
+        record[sectorTail + 1] = record[replacement + 1];
     }
 }
 
@@ -396,6 +396,10 @@ bool parseNtfsBootSector(const uint8_t* sector, size_t length, NtfsVolumeInfo& i
     return true;
 }
 
+void applyUpdateSequence(std::vector<uint8_t>& buffer, uint32_t bytesPerSector) {
+    applyFixups(buffer, bytesPerSector);
+}
+
 bool decodeRunList(const uint8_t* data, size_t length, std::vector<DataRun>& runs, std::string& error) {
     runs.clear();
 
@@ -591,6 +595,76 @@ bool getMftRecordCount(RawDevice& device, const NtfsVolumeInfo& info, uint64_t& 
 
     count = mft.logicalSize / info.mftRecordSize;
     return true;
+}
+
+bool readAttributeData(RawDevice& device, const NtfsVolumeInfo& info, uint64_t recordNumber,
+                       uint32_t attributeType, const std::string& attributeName,
+                       std::vector<uint8_t>& data, std::string& error) {
+    data.clear();
+
+    std::vector<uint8_t> record;
+    if (!readMftRecord(device, info, recordNumber, record, error)) {
+        return false;
+    }
+
+    size_t position = readU16(record.data() + 0x14);
+
+    while (position + 8 <= record.size()) {
+        const uint32_t type = readU32(record.data() + position);
+        if (type == ATTRIBUTE_END) {
+            break;
+        }
+
+        const uint32_t attributeLength = readU32(record.data() + position + 4);
+        if (attributeLength < 16 || position + attributeLength > record.size()) {
+            break;
+        }
+
+        const uint8_t nonResident = record[position + 0x08];
+        const uint8_t nameLength = record[position + 0x09];
+        const uint16_t nameOffset = readU16(record.data() + position + 0x0A);
+
+        bool nameMatches = attributeName.empty() && nameLength == 0;
+        if (!nameMatches && !attributeName.empty() && nameLength > 0) {
+            const size_t nameStart = position + nameOffset;
+            if (nameStart + static_cast<size_t>(nameLength) * 2 <= record.size()) {
+                nameMatches = utf16leToUtf8(record.data() + nameStart, nameLength) == attributeName;
+            }
+        }
+
+        if (type == attributeType && nameMatches) {
+            if (nonResident == 0) {
+                const uint32_t contentSize = readU32(record.data() + position + 0x10);
+                const uint16_t contentOffset = readU16(record.data() + position + 0x14);
+                const size_t start = position + contentOffset;
+                if (start + contentSize > record.size()) {
+                    error = "attribute content is out of bounds";
+                    return false;
+                }
+                data.assign(record.begin() + start, record.begin() + start + contentSize);
+                return true;
+            }
+
+            const uint16_t runListOffset = readU16(record.data() + position + 0x20);
+            const uint64_t realSize = readU64(record.data() + position + 0x30);
+            const size_t runListStart = position + runListOffset;
+
+            std::vector<DataRun> runs;
+            if (runListStart < position + attributeLength) {
+                if (!decodeRunList(record.data() + runListStart, position + attributeLength - runListStart,
+                                   runs, error)) {
+                    return false;
+                }
+            }
+
+            return readExtents(device, info, runs, realSize, data, error);
+        }
+
+        position += attributeLength;
+    }
+
+    error = "attribute not found in record " + std::to_string(recordNumber);
+    return false;
 }
 
 bool readFileRecordData(RawDevice& device, const NtfsVolumeInfo& info, uint64_t recordNumber,

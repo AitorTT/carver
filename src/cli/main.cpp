@@ -2,6 +2,7 @@
 #include "core/device.h"
 #include "core/device_enum.h"
 #include "core/fat.h"
+#include "core/i30.h"
 #include "core/image.h"
 #include "core/ntfs.h"
 #include "core/partition.h"
@@ -33,6 +34,8 @@ void printUsage() {
         "                    (input must be an NTFS volume, e.g. \\\\.\\D:)\n"
         "  --mft-recover     recover deleted files by name from deleted $MFT records\n"
         "                    (input must be an NTFS volume)\n"
+        "  --i30 <input> <output.csv>   list every name found in the NTFS directory\n"
+        "                    indexes, including names left in index slack\n"
         "  --probe <input>   hex dump raw bytes, to check that a device reads correctly\n"
         "        [--offset <bytes>] [--length <bytes>]\n"
         "  --image <input> <destination>   write a byte-for-byte copy and SHA-256 hash\n"
@@ -265,6 +268,101 @@ int main(int argc, char** argv) {
         std::cout << "\n";
         std::cout << "sha256        : " << imageResult.sha256 << "\n";
         std::cout << "\nverify with   : certutil -hashfile \"" << destinationPath << "\" SHA256\n";
+        return 0;
+    }
+
+    if (args[0] == "--i30") {
+        if (args.size() < 3) {
+            std::cerr << "error: --i30 needs an input and an output csv\n";
+            return 1;
+        }
+
+        const std::string inputPath = args[1];
+        const std::string outputCsv = args[2];
+        std::string partitionSelection;
+
+        for (size_t index = 3; index < args.size(); ++index) {
+            if (args[index] == "--partition" && index + 1 < args.size()) {
+                partitionSelection = args[++index];
+            }
+        }
+
+        carver::RawDevice device;
+        std::string error;
+        if (!device.open(carver::utf8ToWide(inputPath), error)) {
+            std::cerr << "error: " << error << "\n";
+            return 1;
+        }
+
+        carver::PartitionResolution resolution;
+        if (!carver::resolveNtfsBase(device, partitionSelection, resolution, error)) {
+            std::cerr << "error: " << error << "\n";
+            return 1;
+        }
+
+        carver::NtfsVolumeInfo volume;
+        std::vector<uint8_t> bootSector(512, 0);
+        uint32_t got = 0;
+        if (!device.readAt(resolution.offset, bootSector.data(), 512, got, error) || got < 512) {
+            std::cerr << "error: cannot read the boot sector: " << error << "\n";
+            return 1;
+        }
+        if (!carver::parseNtfsBootSector(bootSector.data(), got, volume, error)) {
+            std::cerr << "error: input is not an NTFS volume: " << error << "\n";
+            return 1;
+        }
+        volume.baseOffset = resolution.offset;
+
+        uint64_t recordCount = 0;
+        if (!carver::getMftRecordCount(device, volume, recordCount, error)) {
+            std::cerr << "error: " << error << "\n";
+            return 1;
+        }
+
+        std::cout << "input      : " << inputPath << "\n";
+        std::cout << "mft records: " << recordCount << "\n";
+        std::cout << "output     : " << outputCsv << "\n\n";
+
+        const auto indexProgress = [recordCount](const carver::Progress& state) {
+            const double percent = recordCount == 0
+                                       ? 100.0
+                                       : (static_cast<double>(state.bytesScanned) /
+                                          static_cast<double>(recordCount)) * 100.0;
+            std::printf("\r[%5.1f%%] record %llu of %llu        ",
+                        percent,
+                        static_cast<unsigned long long>(state.bytesScanned),
+                        static_cast<unsigned long long>(recordCount));
+            std::fflush(stdout);
+            return true;
+        };
+
+        std::vector<carver::IndexName> names;
+        const carver::I30Result listed = carver::recoverIndexNames(
+            device, volume, recordCount, outputCsv, indexProgress, names, error);
+
+        std::printf("\n\n");
+
+        if (!error.empty()) {
+            std::cerr << "error: " << error << "\n";
+        }
+
+        std::cout << "records scanned    : " << listed.recordsScanned << "\n";
+        std::cout << "directories parsed : " << listed.directoriesScanned << "\n";
+        std::cout << "names from indexes : " << listed.liveEntries << "\n";
+        std::cout << "names from slack   : " << listed.slackEntries << "\n";
+        std::cout << "index              : " << outputCsv << "\n";
+
+        const size_t preview = std::min<size_t>(names.size(), 20);
+        if (preview > 0) {
+            std::cout << "\nfirst " << preview << " names:\n";
+            for (size_t index = 0; index < preview; ++index) {
+                std::cout << "  " << names[index].path
+                          << "  (" << humanBytes(names[index].size) << ")"
+                          << (names[index].fromSlack ? "  [slack]" : "")
+                          << "\n";
+            }
+        }
+
         return 0;
     }
 
