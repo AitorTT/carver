@@ -59,6 +59,8 @@ struct MftFileEntry {
     bool hasAttributeList = false;
     bool hasData = false;
     bool residentData = false;
+    bool compressed = false;
+    uint32_t compressionUnitClusters = 0;
     uint64_t logicalSize = 0;
     uint64_t allocatedSize = 0;
     std::vector<uint8_t> residentContent;

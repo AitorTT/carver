@@ -239,6 +239,20 @@ void applyDataAttribute(const std::vector<uint8_t>& record, size_t position, uin
                       extent.runs, ignored);
     }
 
+    const uint16_t attributeFlags = readU16(record.data() + position + 0x0C);
+    if ((attributeFlags & 0x0001) != 0) {
+        entry.compressed = true;
+        const uint8_t unitExponent = record[position + 0x22];
+        if (unitExponent > 0 && unitExponent < 32) {
+            entry.compressionUnitClusters = 1u << unitExponent;
+        }
+    }
+
+    const uint64_t allocatedSize = readU64(record.data() + position + 0x28);
+    if (allocatedSize > 0) {
+        entry.allocatedSize = allocatedSize;
+    }
+
     entry.dataExtents.push_back(std::move(extent));
 }
 

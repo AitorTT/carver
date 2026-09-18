@@ -1,5 +1,7 @@
 #include "core/recover.h"
 
+#include "core/lznt1.h"
+
 #include <windows.h>
 
 #include <algorithm>
@@ -99,6 +101,77 @@ bool writeEntryData(RawDevice& device, const NtfsVolumeInfo& info, const MftFile
                 ok = false;
             } else {
                 written += count;
+            }
+        }
+    } else if (entry.compressed && entry.compressionUnitClusters > 0 && info.bytesPerCluster > 0 &&
+               !entry.runs.empty() &&
+               entry.logicalSize <= (1ull << 30)) {
+        const uint64_t clusterCount = (entry.logicalSize + info.bytesPerCluster - 1) / info.bytesPerCluster;
+        const uint64_t unitSize = static_cast<uint64_t>(entry.compressionUnitClusters) * info.bytesPerCluster;
+
+        std::vector<int64_t> clusterMap(static_cast<size_t>(clusterCount), -1);
+        uint64_t vcn = 0;
+        for (const auto& run : entry.runs) {
+            for (uint64_t index = 0; index < run.length && vcn < clusterCount; ++index, ++vcn) {
+                clusterMap[static_cast<size_t>(vcn)] =
+                    run.sparse ? -1 : static_cast<int64_t>(run.lcn + index);
+            }
+            if (vcn >= clusterCount) {
+                break;
+            }
+        }
+
+        std::vector<uint8_t> onDisk(static_cast<size_t>(clusterCount * info.bytesPerCluster), 0);
+        for (uint64_t cluster = 0; cluster < clusterCount; ++cluster) {
+            const int64_t lcn = clusterMap[static_cast<size_t>(cluster)];
+            if (lcn < 0) {
+                continue;
+            }
+            uint32_t got = 0;
+            if (!device.readAt(info.clusterOffset(static_cast<uint64_t>(lcn)),
+                               onDisk.data() + cluster * info.bytesPerCluster,
+                               info.bytesPerCluster, got, error) ||
+                got != info.bytesPerCluster) {
+                ok = false;
+                break;
+            }
+        }
+
+        std::vector<uint8_t> plain;
+        if (ok) {
+            const uint64_t unitCount = (entry.logicalSize + unitSize - 1) / unitSize;
+            std::vector<bool> unitCompressed(static_cast<size_t>(unitCount), false);
+            for (uint64_t unit = 0; unit < unitCount; ++unit) {
+                const uint64_t first = unit * entry.compressionUnitClusters;
+                const uint64_t last = std::min<uint64_t>(
+                    first + entry.compressionUnitClusters, clusterCount);
+                uint64_t allocated = 0;
+                for (uint64_t cluster = first; cluster < last; ++cluster) {
+                    if (clusterMap[static_cast<size_t>(cluster)] >= 0) {
+                        ++allocated;
+                    }
+                }
+                unitCompressed[static_cast<size_t>(unit)] = allocated < (last - first);
+            }
+
+            if (!lznt1DecompressUnits(onDisk, unitCompressed, unitSize,
+                                      entry.logicalSize, plain, error)) {
+                ok = false;
+            }
+        }
+
+        if (ok) {
+            uint64_t offset = 0;
+            while (offset < plain.size()) {
+                const DWORD chunk =
+                    static_cast<DWORD>(std::min<uint64_t>(plain.size() - offset, 1u << 20));
+                DWORD count = 0;
+                if (!WriteFile(output, plain.data() + offset, chunk, &count, nullptr) || count == 0) {
+                    ok = false;
+                    break;
+                }
+                written += count;
+                offset += count;
             }
         }
     } else {
