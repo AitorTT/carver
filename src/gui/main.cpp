@@ -34,8 +34,44 @@ ID3D11RenderTargetView* g_renderTarget = nullptr;
 HWND g_window = nullptr;
 bool g_resizePending = false;
 
-enum class SourceKind { PhysicalDrive, ImageFile };
+enum class SourceKind { Volume, PhysicalDrive, ImageFile };
 enum class Mode { CarveWhole, CarveFree, MftRecover };
+
+struct Enumeration {
+    std::mutex mutex;
+    std::thread worker;
+    std::atomic<bool> running{false};
+    std::atomic<bool> finished{false};
+    std::atomic<int> generation{0};
+    std::vector<carver::DriveInfo> drives;
+    std::vector<carver::VolumeInfo> volumes;
+
+    void start() {
+        if (worker.joinable()) {
+            worker.join();
+        }
+        running.store(true);
+        finished.store(false);
+        worker = std::thread([this] {
+            std::vector<carver::DriveInfo> foundDrives = carver::listPhysicalDrives();
+            std::vector<carver::VolumeInfo> foundVolumes = carver::listVolumes();
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                drives = std::move(foundDrives);
+                volumes = std::move(foundVolumes);
+            }
+            generation.fetch_add(1);
+            finished.store(true);
+            running.store(false);
+        });
+    }
+
+    void join() {
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+};
 
 struct Job {
     std::mutex mutex;
@@ -370,18 +406,22 @@ void runJob(Job& job,
 }
 
 struct UiState {
-    SourceKind source = SourceKind::ImageFile;
+    SourceKind source = SourceKind::Volume;
     Mode mode = Mode::MftRecover;
     int selectedDrive = -1;
+    int selectedVolume = -1;
     char imagePath[512] = {};
     char outputPath[512] = {};
     std::vector<carver::DriveInfo> drives;
-    bool drivesLoaded = false;
+    std::vector<carver::VolumeInfo> volumes;
+    bool selectionInitialised = false;
+    int seenGeneration = -1;
     bool autoScroll = true;
 };
 
-void buildUi(UiState& ui, Job& job) {
+void buildUi(UiState& ui, Job& job, Enumeration& enumeration) {
     const bool busy = job.running;
+    const bool enumerating = enumeration.running.load();
 
     if (!carver::isElevated()) {
         ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f),
@@ -389,18 +429,24 @@ void buildUi(UiState& ui, Job& job) {
         ImGui::Separator();
     }
 
-    ImGui::BeginChild("left", ImVec2(400, 0), ImGuiChildFlags_Borders);
+    ImGui::BeginChild("left", ImVec2(430, 0), ImGuiChildFlags_Borders);
 
     ImGui::TextUnformatted("Source");
     ImGui::Separator();
 
-    if (ImGui::RadioButton("Disk image file", ui.source == SourceKind::ImageFile)) {
-        ui.source = SourceKind::ImageFile;
+    ImGui::BeginDisabled(busy);
+    if (ImGui::RadioButton("Volume", ui.source == SourceKind::Volume)) {
+        ui.source = SourceKind::Volume;
     }
     ImGui::SameLine();
     if (ImGui::RadioButton("Physical drive", ui.source == SourceKind::PhysicalDrive)) {
         ui.source = SourceKind::PhysicalDrive;
     }
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Image file", ui.source == SourceKind::ImageFile)) {
+        ui.source = SourceKind::ImageFile;
+    }
+    ImGui::EndDisabled();
 
     ImGui::Spacing();
 
@@ -417,25 +463,52 @@ void buildUi(UiState& ui, Job& job) {
         }
         ImGui::EndDisabled();
     } else {
-        if (ImGui::Button("Refresh drive list")) {
-            ui.drives = carver::listPhysicalDrives();
-            ui.drivesLoaded = true;
+        ImGui::BeginDisabled(busy || enumerating);
+        if (ImGui::Button("Refresh")) {
+            enumeration.start();
         }
-        if (ui.drives.empty()) {
-            ImGui::TextDisabled(ui.drivesLoaded ? "no drives available" : "click refresh to enumerate drives");
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (enumerating) {
+            ImGui::TextDisabled("enumerating drives...");
+        } else {
+            ImGui::TextDisabled("%d volumes, %d drives", static_cast<int>(ui.volumes.size()),
+                                static_cast<int>(ui.drives.size()));
         }
-        for (int index = 0; index < static_cast<int>(ui.drives.size()); ++index) {
-            const auto& drive = ui.drives[index];
-            char label[256];
-            std::snprintf(label, sizeof(label), "%s  |  %s  |  %s", drive.devicePath.c_str(),
-                          humanBytes(drive.size).c_str(), describeBusType(drive.busType).c_str());
-            if (ImGui::Selectable(label, ui.selectedDrive == index)) {
-                ui.selectedDrive = index;
+
+        ImGui::BeginChild("targets", ImVec2(0, 210), ImGuiChildFlags_Borders);
+
+        if (ui.source == SourceKind::Volume) {
+            if (ui.volumes.empty()) {
+                ImGui::TextDisabled(enumerating ? "searching..." : "no volumes found");
             }
-            if (!drive.model.empty()) {
-                ImGui::TextDisabled("    %s%s", drive.model.c_str(), drive.removable ? "  [removable]" : "");
+            for (int index = 0; index < static_cast<int>(ui.volumes.size()); ++index) {
+                const auto& volume = ui.volumes[index];
+                char label[320];
+                std::snprintf(label, sizeof(label), "%-4s %-6s %9s  %s", volume.mountPoint.c_str(),
+                              volume.fileSystem.c_str(), humanBytes(volume.size).c_str(),
+                              volume.label.c_str());
+                if (ImGui::Selectable(label, ui.selectedVolume == index)) {
+                    ui.selectedVolume = index;
+                }
+            }
+        } else {
+            if (ui.drives.empty()) {
+                ImGui::TextDisabled(enumerating ? "searching..." : "no drives found");
+            }
+            for (int index = 0; index < static_cast<int>(ui.drives.size()); ++index) {
+                const auto& drive = ui.drives[index];
+                char label[320];
+                std::snprintf(label, sizeof(label), "%-22s %9s  %-7s %s", drive.devicePath.c_str(),
+                              humanBytes(drive.size).c_str(), describeBusType(drive.busType).c_str(),
+                              drive.model.c_str());
+                if (ImGui::Selectable(label, ui.selectedDrive == index)) {
+                    ui.selectedDrive = index;
+                }
             }
         }
+
+        ImGui::EndChild();
     }
 
     ImGui::Spacing();
@@ -445,7 +518,7 @@ void buildUi(UiState& ui, Job& job) {
     ImGui::SetNextItemWidth(-90);
     ImGui::InputText("##output", ui.outputPath, sizeof(ui.outputPath));
     ImGui::SameLine();
-    if (ImGui::Button("Browse...", ImVec2(80, 0))) {
+    if (ImGui::Button("Browse##output", ImVec2(80, 0))) {
         const std::string picked = browseForFolder();
         if (!picked.empty()) {
             std::snprintf(ui.outputPath, sizeof(ui.outputPath), "%s", picked.c_str());
@@ -473,7 +546,15 @@ void buildUi(UiState& ui, Job& job) {
     ImGui::Spacing();
 
     std::string resolvedSource;
-    if (ui.source == SourceKind::PhysicalDrive) {
+    bool targetIsNtfsVolume = false;
+
+    if (ui.source == SourceKind::Volume) {
+        if (ui.selectedVolume >= 0 && ui.selectedVolume < static_cast<int>(ui.volumes.size())) {
+            const auto& volume = ui.volumes[ui.selectedVolume];
+            resolvedSource = volume.devicePath;
+            targetIsNtfsVolume = volume.fileSystem == "NTFS";
+        }
+    } else if (ui.source == SourceKind::PhysicalDrive) {
         if (ui.selectedDrive >= 0 && ui.selectedDrive < static_cast<int>(ui.drives.size())) {
             resolvedSource = ui.drives[ui.selectedDrive].devicePath;
         }
@@ -481,15 +562,25 @@ void buildUi(UiState& ui, Job& job) {
         resolvedSource = ui.imagePath;
     }
 
+    const bool needsNtfsVolume = ui.mode != Mode::CarveWhole;
+
+    if (needsNtfsVolume && !resolvedSource.empty() && !targetIsNtfsVolume) {
+        const char* reason = ui.source == SourceKind::PhysicalDrive
+                                 ? "this mode needs a volume, not a whole disk"
+                                 : "this mode needs an NTFS volume";
+        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "Warning: %s", reason);
+        ImGui::Spacing();
+    }
+
     const bool canStart = !busy && !resolvedSource.empty() && ui.outputPath[0] != '\0';
 
     if (busy) {
-        if (ImGui::Button("Stop", ImVec2(120, 32))) {
+        if (ImGui::Button("Stop", ImVec2(140, 32))) {
             job.cancel.store(true);
         }
     } else {
         ImGui::BeginDisabled(!canStart);
-        if (ImGui::Button("Start scan", ImVec2(120, 32))) {
+        if (ImGui::Button("Start scan", ImVec2(140, 32))) {
             if (job.worker.joinable()) {
                 job.worker.join();
             }
@@ -752,11 +843,8 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
 
     UiState ui;
     Job job;
-
-    if (carver::isElevated()) {
-        ui.drives = carver::listPhysicalDrives();
-        ui.drivesLoaded = true;
-    }
+    Enumeration enumeration;
+    enumeration.start();
 
     bool running = true;
     while (running) {
@@ -788,7 +876,34 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
         ImGui::Begin("carver", nullptr,
                      ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoResize |
                      ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBringToFrontOnFocus);
-        buildUi(ui, job);
+
+        if (enumeration.finished.load() && enumeration.generation.load() != ui.seenGeneration) {
+            const int generation = enumeration.generation.load();
+            {
+                std::lock_guard<std::mutex> lock(enumeration.mutex);
+                ui.drives = enumeration.drives;
+                ui.volumes = enumeration.volumes;
+            }
+            ui.seenGeneration = generation;
+
+            if (!ui.selectionInitialised && (!ui.volumes.empty() || !ui.drives.empty())) {
+                ui.selectionInitialised = true;
+                for (int index = 0; index < static_cast<int>(ui.volumes.size()); ++index) {
+                    if (carver::isNtfsVolume(ui.volumes[index])) {
+                        ui.selectedVolume = index;
+                        break;
+                    }
+                }
+                if (ui.selectedVolume < 0 && !ui.volumes.empty()) {
+                    ui.selectedVolume = 0;
+                }
+                if (ui.selectedVolume < 0 && !ui.drives.empty()) {
+                    ui.selectedDrive = 0;
+                }
+            }
+        }
+
+        buildUi(ui, job, enumeration);
         ImGui::End();
 
         ImGui::Render();
@@ -804,6 +919,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
     if (job.worker.joinable()) {
         job.worker.join();
     }
+    enumeration.join();
 
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();

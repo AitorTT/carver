@@ -92,4 +92,51 @@ std::vector<DriveInfo> listPhysicalDrives() {
     return drives;
 }
 
+std::vector<VolumeInfo> listVolumes() {
+    std::vector<VolumeInfo> volumes;
+
+    wchar_t roots[512] = {};
+    if (GetLogicalDriveStringsW(511, roots) == 0) {
+        return volumes;
+    }
+
+    for (const wchar_t* root = roots; *root != L'\0'; root += std::wcslen(root) + 1) {
+        const UINT type = GetDriveTypeW(root);
+        if (type != DRIVE_FIXED && type != DRIVE_REMOVABLE && type != DRIVE_REMOTE) {
+            continue;
+        }
+
+        VolumeInfo info;
+        info.mountPoint = wideToUtf8(root);
+
+        std::wstring devicePath = L"\\\\.\\";
+        devicePath += root[0];
+        devicePath += L':';
+        info.devicePath = wideToUtf8(devicePath);
+
+        wchar_t label[256] = {};
+        wchar_t fileSystem[64] = {};
+        if (GetVolumeInformationW(root, label, 256, nullptr, nullptr, nullptr, fileSystem, 64)) {
+            info.label = wideToUtf8(label);
+            info.fileSystem = wideToUtf8(fileSystem);
+        }
+
+        ULARGE_INTEGER availableToCaller{};
+        ULARGE_INTEGER totalBytes{};
+        ULARGE_INTEGER totalFree{};
+        if (GetDiskFreeSpaceExW(root, &availableToCaller, &totalBytes, &totalFree)) {
+            info.size = totalBytes.QuadPart;
+            info.free = totalFree.QuadPart;
+        }
+
+        volumes.push_back(std::move(info));
+    }
+
+    return volumes;
+}
+
+bool isNtfsVolume(const VolumeInfo& volume) {
+    return volume.fileSystem == "NTFS";
+}
+
 }

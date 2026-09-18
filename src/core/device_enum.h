@@ -15,6 +15,19 @@ struct DriveInfo {
     bool removable = false;
 };
 
+struct VolumeInfo {
+    std::string devicePath;
+    std::string mountPoint;
+    std::string label;
+    std::string fileSystem;
+    uint64_t size = 0;
+    uint64_t free = 0;
+};
+
 std::vector<DriveInfo> listPhysicalDrives();
+
+std::vector<VolumeInfo> listVolumes();
+
+bool isNtfsVolume(const VolumeInfo& volume);
 
 }
