@@ -118,6 +118,39 @@ bool isElevated() {
     return ok && elevation.TokenIsElevated != 0;
 }
 
+bool ensureDirectoryTree(const std::wstring& path) {
+    if (path.empty()) {
+        return false;
+    }
+
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    if (attributes != INVALID_FILE_ATTRIBUTES) {
+        return (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    }
+
+    const DWORD error = GetLastError();
+    if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) {
+        return false;
+    }
+
+    const size_t separator = path.find_last_of(L"\\/");
+    if (separator == std::wstring::npos) {
+        return false;
+    }
+
+    const std::wstring parent = path.substr(0, separator);
+    if (!parent.empty() && parent.back() != L':') {
+        if (!ensureDirectoryTree(parent)) {
+            return false;
+        }
+    }
+
+    if (CreateDirectoryW(path.c_str(), nullptr)) {
+        return true;
+    }
+    return GetLastError() == ERROR_ALREADY_EXISTS;
+}
+
 std::string wideToUtf8(const std::wstring& value) {
     if (value.empty()) {
         return {};

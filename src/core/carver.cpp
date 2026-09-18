@@ -38,13 +38,6 @@ std::string slugify(const std::string& value) {
     return result;
 }
 
-bool ensureDirectory(const std::wstring& path) {
-    if (CreateDirectoryW(path.c_str(), nullptr)) {
-        return true;
-    }
-    return GetLastError() == ERROR_ALREADY_EXISTS;
-}
-
 uint64_t carveOne(RawDevice& device,
                   uint64_t startOffset,
                   uint64_t regionEnd,
@@ -185,7 +178,7 @@ CarveResult carveDevice(RawDevice& device,
     }
 
     const std::wstring outputRoot = utf8ToWide(outputDirectory);
-    if (!ensureDirectory(outputRoot)) {
+    if (!ensureDirectoryTree(outputRoot)) {
         error = "cannot create output directory " + outputDirectory;
         return result;
     }

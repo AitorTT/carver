@@ -5,6 +5,7 @@
 #include "core/recover.h"
 #include "core/signature.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
@@ -29,6 +30,8 @@ void printUsage() {
         "                    (input must be an NTFS volume, e.g. \\\\.\\D:)\n"
         "  --mft-recover     recover deleted files by name from deleted $MFT records\n"
         "                    (input must be an NTFS volume)\n"
+        "  --probe <input>   hex dump raw bytes, to check that a device reads correctly\n"
+        "        [--offset <bytes>] [--length <bytes>]\n"
         "\n"
         "input is a disk image file, or a raw device such as\n"
         "\\\\.\\PhysicalDrive2 which requires an elevated shell.\n";
@@ -84,6 +87,66 @@ int main(int argc, char** argv) {
 
     if (args[0] == "--list") {
         printDrives();
+        return 0;
+    }
+
+    if (args[0] == "--probe") {
+        std::string path;
+        uint64_t offset = 0;
+        uint64_t length = 512;
+
+        for (size_t index = 1; index < args.size(); ++index) {
+            if (args[index] == "--offset" && index + 1 < args.size()) {
+                offset = std::strtoull(args[++index].c_str(), nullptr, 0);
+            } else if (args[index] == "--length" && index + 1 < args.size()) {
+                length = std::strtoull(args[++index].c_str(), nullptr, 0);
+            } else if (path.empty()) {
+                path = args[index];
+            }
+        }
+
+        if (path.empty()) {
+            std::cerr << "error: --probe needs an input path\n";
+            return 1;
+        }
+
+        carver::RawDevice device;
+        std::string error;
+        if (!device.open(carver::utf8ToWide(path), error)) {
+            std::cerr << "error: " << error << "\n";
+            return 1;
+        }
+
+        std::cout << "input  : " << path << "\n";
+        std::cout << "size   : " << humanBytes(device.size()) << " (" << device.size() << " bytes)\n";
+        std::cout << "sector : " << device.sectorSize() << " bytes\n\n";
+
+        std::vector<uint8_t> buffer(static_cast<size_t>(std::min<uint64_t>(length, 1u << 20)));
+        uint32_t got = 0;
+        if (!device.readAt(offset, buffer.data(), static_cast<uint32_t>(buffer.size()), got, error)) {
+            std::cerr << "error: " << error << "\n";
+            return 1;
+        }
+        buffer.resize(got);
+
+        for (size_t index = 0; index < buffer.size(); index += 16) {
+            std::printf("%08llX  ", static_cast<unsigned long long>(offset + index));
+            for (size_t column = 0; column < 16; ++column) {
+                if (index + column < buffer.size()) {
+                    std::printf("%02X ", buffer[index + column]);
+                } else {
+                    std::printf("   ");
+                }
+            }
+            std::printf(" |");
+            for (size_t column = 0; column < 16 && index + column < buffer.size(); ++column) {
+                const uint8_t value = buffer[index + column];
+                std::printf("%c", (value >= 0x20 && value < 0x7F) ? static_cast<char>(value) : '.');
+            }
+            std::printf("|\n");
+        }
+
+        std::cout << "\n" << got << " bytes read\n";
         return 0;
     }
 

@@ -11,13 +11,6 @@ namespace carver {
 
 namespace {
 
-bool ensureDirectory(const std::wstring& path) {
-    if (CreateDirectoryW(path.c_str(), nullptr)) {
-        return true;
-    }
-    return GetLastError() == ERROR_ALREADY_EXISTS;
-}
-
 bool isClusterAllocated(const std::vector<uint8_t>& bitmap, uint64_t cluster) {
     const size_t index = static_cast<size_t>(cluster / 8);
     if (index >= bitmap.size()) {
@@ -231,7 +224,7 @@ RecoverResult recoverDeletedFiles(RawDevice& device,
     }
 
     const std::wstring outputRoot = utf8ToWide(outputDirectory);
-    if (!ensureDirectory(outputRoot)) {
+    if (!ensureDirectoryTree(outputRoot)) {
         error = "cannot create output directory " + outputDirectory;
         return result;
     }
