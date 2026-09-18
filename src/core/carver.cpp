@@ -159,12 +159,27 @@ CarveResult carveDevice(RawDevice& device,
     }
 
     const uint64_t deviceSize = device.size();
-    const uint64_t start = std::min(options.startOffset, deviceSize);
-    const uint64_t end = (options.endOffset == 0 || options.endOffset > deviceSize)
-                             ? deviceSize
-                             : options.endOffset;
 
-    if (start >= end) {
+    std::vector<ByteRange> plan;
+    if (!options.ranges.empty()) {
+        plan.reserve(options.ranges.size());
+        for (const auto& requested : options.ranges) {
+            const ByteRange clamped{std::min(requested.start, deviceSize), std::min(requested.end, deviceSize)};
+            if (clamped.start < clamped.end) {
+                plan.push_back(clamped);
+            }
+        }
+    } else {
+        const uint64_t begin = std::min(options.startOffset, deviceSize);
+        const uint64_t finish = (options.endOffset == 0 || options.endOffset > deviceSize)
+                                    ? deviceSize
+                                    : options.endOffset;
+        if (begin < finish) {
+            plan.push_back(ByteRange{begin, finish});
+        }
+    }
+
+    if (plan.empty()) {
         error = "scan range is empty";
         return result;
     }
@@ -182,19 +197,34 @@ CarveResult carveDevice(RawDevice& device,
     std::vector<uint8_t> buffer(static_cast<size_t>(chunkSize));
 
     Progress state;
-    state.bytesTotal = end - start;
+    for (const auto& range : plan) {
+        state.bytesTotal += range.end - range.start;
+    }
 
-    uint64_t position = start;
     uint64_t fileIndex = 0;
+    uint64_t scannedBefore = 0;
+    size_t planIndex = 0;
+    uint64_t position = plan.front().start;
 
-    while (position < end) {
-        const uint32_t want = static_cast<uint32_t>(std::min<uint64_t>(buffer.size(), end - position));
+    while (planIndex < plan.size()) {
+        if (position >= plan[planIndex].end) {
+            scannedBefore += plan[planIndex].end - plan[planIndex].start;
+            ++planIndex;
+            if (planIndex < plan.size()) {
+                position = plan[planIndex].start;
+            }
+            continue;
+        }
+
+        const uint64_t rangeEnd = plan[planIndex].end;
+        const uint32_t want = static_cast<uint32_t>(std::min<uint64_t>(buffer.size(), rangeEnd - position));
         uint32_t got = 0;
         if (!device.readAt(position, buffer.data(), want, got, error)) {
             return result;
         }
         if (got == 0) {
-            break;
+            position = rangeEnd;
+            continue;
         }
 
         const Signature* found = nullptr;
@@ -247,7 +277,7 @@ CarveResult carveDevice(RawDevice& device,
                 const std::wstring outputPath = outputRoot + L"\\" + utf8ToWide(baseName);
 
                 uint64_t written = 0;
-                const uint64_t endOffset = carveOne(device, carveStart, end, *found, declared, outputPath, written);
+                const uint64_t endOffset = carveOne(device, carveStart, rangeEnd, *found, declared, outputPath, written);
 
                 if (written > 0) {
                     result.filesRecovered += 1;
@@ -267,11 +297,11 @@ CarveResult carveDevice(RawDevice& device,
         } else {
             position += (got > overlap) ? got - overlap : got;
             if (got < want) {
-                break;
+                position = rangeEnd;
             }
         }
 
-        result.bytesScanned = position - start;
+        result.bytesScanned = scannedBefore + (std::min(position, rangeEnd) - plan[planIndex].start);
         state.bytesScanned = result.bytesScanned;
 
         if (progress && !progress(state)) {

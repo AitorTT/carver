@@ -1,6 +1,7 @@
 #include "core/carver.h"
 #include "core/device.h"
 #include "core/device_enum.h"
+#include "core/ntfs.h"
 #include "core/signature.h"
 
 #include <cstdio>
@@ -23,6 +24,8 @@ void printUsage() {
         "  --start <bytes>   first byte to scan (default 0)\n"
         "  --end <bytes>     last byte to scan (default end of input)\n"
         "  --chunk <bytes>   read chunk size (default 8 MiB)\n"
+        "  --free-only       scan only unallocated NTFS clusters, using $Bitmap\n"
+        "                    (input must be an NTFS volume, e.g. \\\\.\\D:)\n"
         "\n"
         "input is a disk image file, or a raw device such as\n"
         "\\\\.\\PhysicalDrive2 which requires an elevated shell.\n";
@@ -87,9 +90,14 @@ int main(int argc, char** argv) {
     }
 
     carver::CarveOptions options;
+    bool freeOnly = false;
 
     for (size_t index = 2; index < args.size(); ++index) {
         const std::string& flag = args[index];
+        if (flag == "--free-only") {
+            freeOnly = true;
+            continue;
+        }
         if (index + 1 >= args.size()) {
             std::cerr << "error: " << flag << " requires a value\n";
             return 1;
@@ -116,13 +124,56 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    carver::NtfsVolumeInfo volume;
+
+    if (freeOnly) {
+        std::vector<uint8_t> bootSector(512, 0);
+        uint32_t got = 0;
+        if (!device.readAt(0, bootSector.data(), static_cast<uint32_t>(bootSector.size()), got, error) || got < 512) {
+            std::cerr << "error: cannot read boot sector: " << error << "\n";
+            return 1;
+        }
+        if (!carver::parseNtfsBootSector(bootSector.data(), got, volume, error)) {
+            std::cerr << "error: input is not an NTFS volume: " << error << "\n";
+            return 1;
+        }
+
+        std::vector<uint8_t> bitmap;
+        if (!carver::readBitmap(device, volume, bitmap, error)) {
+            std::cerr << "error: cannot read $Bitmap: " << error << "\n";
+            return 1;
+        }
+
+        options.ranges = carver::freeClusterRanges(bitmap, volume.totalClusters(), volume.bytesPerCluster);
+
+        uint64_t freeBytes = 0;
+        for (const auto& range : options.ranges) {
+            freeBytes += range.end - range.start;
+        }
+
+        std::cout << "filesystem : NTFS, " << volume.bytesPerCluster << " byte clusters\n";
+        std::cout << "clusters   : " << volume.totalClusters() << "\n";
+        std::cout << "bitmap     : " << bitmap.size() << " bytes\n";
+        std::cout << "free       : " << options.ranges.size() << " extents, "
+                  << humanBytes(freeBytes) << "\n\n";
+
+        if (options.ranges.empty()) {
+            std::cout << "no unallocated clusters found; nothing to scan\n";
+            return 0;
+        }
+    }
+
     const uint64_t scanEnd = options.endOffset == 0 ? device.size() : options.endOffset;
 
     std::cout << "input  : " << inputPath << "\n";
     std::cout << "size   : " << humanBytes(device.size()) << " (" << device.size() << " bytes)\n";
     std::cout << "sector : " << device.sectorSize() << " bytes\n";
     std::cout << "output : " << outputDirectory << "\n";
-    std::cout << "range  : " << options.startOffset << " .. " << scanEnd << "\n";
+    if (options.ranges.empty()) {
+        std::cout << "range  : " << options.startOffset << " .. " << scanEnd << "\n";
+    } else {
+        std::cout << "range  : unallocated clusters only\n";
+    }
     std::cout << "chunk  : " << humanBytes(options.chunkSize) << "\n\n";
 
     const auto& signatures = carver::defaultSignatures();

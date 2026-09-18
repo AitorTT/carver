@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/device.h"
+#include "core/range.h"
 #include "core/signature.h"
 
 #include <cstdint>
@@ -25,6 +26,7 @@ struct CarveOptions {
     uint64_t startOffset = 0;
     uint64_t endOffset = 0;
     uint64_t chunkSize = 8ull * 1024ull * 1024ull;
+    std::vector<ByteRange> ranges;
 };
 
 struct CarveResult {
