@@ -20,6 +20,7 @@ add_library(carver_core STATIC
   src/core/device_enum.cpp
   src/core/fat.cpp
   src/core/i30.cpp
+  src/core/lznt1.cpp
   src/core/image.cpp
   src/core/ntfs.cpp
   src/core/partition.cpp

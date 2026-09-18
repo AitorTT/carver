@@ -4,6 +4,7 @@
 #include "core/fat.h"
 #include "core/i30.h"
 #include "core/image.h"
+#include "core/lznt1.h"
 #include "core/ntfs.h"
 #include "core/partition.h"
 #include "core/recover.h"
@@ -36,6 +37,7 @@ void printUsage() {
         "                    (input must be an NTFS volume)\n"
         "  --i30 <input> <output.csv>   list every name found in the NTFS directory\n"
         "                    indexes, including names left in index slack\n"
+        "  --lznt1 <input> <output>     decompress a raw LZNT1 stream\n"
         "  --probe <input>   hex dump raw bytes, to check that a device reads correctly\n"
         "        [--offset <bytes>] [--length <bytes>]\n"
         "  --image <input> <destination>   write a byte-for-byte copy and SHA-256 hash\n"
@@ -268,6 +270,55 @@ int main(int argc, char** argv) {
         std::cout << "\n";
         std::cout << "sha256        : " << imageResult.sha256 << "\n";
         std::cout << "\nverify with   : certutil -hashfile \"" << destinationPath << "\" SHA256\n";
+        return 0;
+    }
+
+    if (args[0] == "--lznt1") {
+        if (args.size() < 3) {
+            std::cerr << "error: --lznt1 needs an input and an output\n";
+            return 1;
+        }
+
+        std::vector<uint8_t> compressed;
+        {
+            FILE* file = nullptr;
+            if (fopen_s(&file, args[1].c_str(), "rb") != 0 || file == nullptr) {
+                std::cerr << "error: cannot open " << args[1] << "\n";
+                return 1;
+            }
+            std::fseek(file, 0, SEEK_END);
+            const long size = std::ftell(file);
+            std::fseek(file, 0, SEEK_SET);
+            if (size > 0) {
+                compressed.resize(static_cast<size_t>(size));
+                if (std::fread(compressed.data(), 1, compressed.size(), file) != compressed.size()) {
+                    std::fclose(file);
+                    std::cerr << "error: short read on " << args[1] << "\n";
+                    return 1;
+                }
+            }
+            std::fclose(file);
+        }
+
+        std::vector<uint8_t> decompressed;
+        std::string error;
+        if (!carver::lznt1Decompress(compressed.data(), compressed.size(), decompressed, error)) {
+            std::cerr << "error: " << error << "\n";
+            return 1;
+        }
+
+        FILE* out = nullptr;
+        if (fopen_s(&out, args[2].c_str(), "wb") != 0 || out == nullptr) {
+            std::cerr << "error: cannot create " << args[2] << "\n";
+            return 1;
+        }
+        if (!decompressed.empty()) {
+            std::fwrite(decompressed.data(), 1, decompressed.size(), out);
+        }
+        std::fclose(out);
+
+        std::cout << "input      : " << args[1] << " (" << compressed.size() << " bytes)\n";
+        std::cout << "output     : " << args[2] << " (" << decompressed.size() << " bytes)\n";
         return 0;
     }
 
