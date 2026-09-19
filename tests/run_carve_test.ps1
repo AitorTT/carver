@@ -306,6 +306,50 @@ foreach ($file in $recovered) {
     Write-Host ("  {0,-30} {1,10} bytes" -f $file.Name, $file.Length)
 }
 
+# A second pass with --skip-ext: the jpg and png signatures must disappear while
+# the other types are untouched. Note the name to skip is the signature's own
+# extension, which for JPEG is "jpg" even though the file is normally ".jpeg".
+Write-Host ''
+Write-Host '=== carving again, skipping jpg and png ==='
+
+$skipDir = Join-Path $WorkDir 'recovered_skip'
+if (Test-Path -LiteralPath $skipDir) { Remove-Item -LiteralPath $skipDir -Recurse -Force }
+
+$previous = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try { $skipOutput = & $CarverExe $imagePath $skipDir --chunk $ChunkSize --skip-ext jpg,png 2>&1 | Out-String }
+finally { $ErrorActionPreference = $previous }
+if ($LASTEXITCODE -ne 0) { throw "carver-cli exited with $LASTEXITCODE" }
+
+$skipRecovered = @(Get-ChildItem -LiteralPath $skipDir -File)
+$skipHashes = @{}
+foreach ($file in $skipRecovered) { $skipHashes[(Get-Sha256 $file.FullName)] = $file.Name }
+
+foreach ($case in @(@{ Name = 'jpeg'; Path = $jpegPath }, @{ Name = 'png'; Path = $pngPath })) {
+    if ($skipHashes.ContainsKey((Get-Sha256 $case.Path))) {
+        Write-Host ("  [FAIL] {0,-5} was recovered despite --skip-ext" -f $case.Name)
+        $failures += ("skip-" + $case.Name)
+    } else {
+        Write-Host ("  [ok]   {0,-5} skipped as asked" -f $case.Name)
+    }
+}
+
+foreach ($case in @(@{ Name = 'gif'; Path = $gifPath }, @{ Name = 'pdf'; Path = $pdfPath })) {
+    if ($skipHashes.ContainsKey((Get-Sha256 $case.Path))) {
+        Write-Host ("  [ok]   {0,-5} still recovered while other types are skipped" -f $case.Name)
+    } else {
+        Write-Host ("  [FAIL] {0,-5} went missing while skipping jpg and png" -f $case.Name)
+        $failures += ("keep-" + $case.Name)
+    }
+}
+
+if ($skipOutput -match 'skipping\s*:\s*\.jpg, \.png') {
+    Write-Host '  [ok]   the run reported what it was skipping'
+} else {
+    Write-Host '  [FAIL] the skipping line was not reported'
+    $failures += 'skip-report'
+}
+
 Write-Host ''
 if ($failures.Count -gt 0) {
     Write-Host ("FAILED: {0}" -f ($failures -join ', '))

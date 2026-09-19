@@ -31,6 +31,10 @@ void printUsage() {
         "  --start <bytes>   first byte to scan (default 0)\n"
         "  --end <bytes>     last byte to scan (default end of input)\n"
         "  --chunk <bytes>   read chunk size (default 8 MiB)\n"
+        "  --skip-ext <list> skip these extensions, comma separated, e.g. epub,pdf.\n"
+        "                    Applies to carving and to --mft-recover. In carve modes\n"
+        "                    an extension matches a signature type, so skipping zip\n"
+        "                    also skips epub, docx, apk and jar.\n"
         "  --free-only       scan only unallocated NTFS clusters, using $Bitmap\n"
         "                    (input must be an NTFS volume, e.g. \\\\.\\D:)\n"
         "  --mft-recover     recover deleted files by name from deleted $MFT records\n"
@@ -538,6 +542,7 @@ int main(int argc, char** argv) {
     bool freeOnly = false;
     bool mftRecover = false;
     std::string partitionSelection;
+    std::vector<std::string> skipExtensions;
 
     for (size_t index = 2; index < args.size(); ++index) {
         const std::string& flag = args[index];
@@ -561,11 +566,15 @@ int main(int argc, char** argv) {
             options.chunkSize = std::strtoull(args[++index].c_str(), nullptr, 0);
         } else if (flag == "--partition") {
             partitionSelection = args[++index];
+        } else if (flag == "--skip-ext") {
+            skipExtensions = carver::parseExtensionList(args[++index]);
         } else {
             std::cerr << "error: unknown option " << flag << "\n";
             return 1;
         }
     }
+
+    options.skipExtensions = skipExtensions;
 
     const std::string inputPath = args[0];
     const std::string outputDirectory = args[1];
@@ -704,7 +713,15 @@ int main(int argc, char** argv) {
         }
 
         std::cout << "mft records: " << recordCount << "\n";
-        std::cout << "output     : " << outputDirectory << "\n\n";
+        std::cout << "output     : " << outputDirectory << "\n";
+        if (!skipExtensions.empty()) {
+            std::cout << "skipping   : ";
+            for (size_t index = 0; index < skipExtensions.size(); ++index) {
+                std::cout << (index > 0 ? ", " : "") << "." << skipExtensions[index];
+            }
+            std::cout << "\n";
+        }
+        std::cout << "\n";
 
         const auto recoverProgress = [](const carver::Progress& state) {
             const double percent = state.bytesTotal == 0
@@ -722,6 +739,7 @@ int main(int argc, char** argv) {
         };
 
         carver::RecoverOptions recoverOptions;
+        recoverOptions.skipExtensions = skipExtensions;
         std::vector<carver::RecoveredFile> index;
 
         const carver::RecoverResult recovered = carver::recoverDeletedFiles(
@@ -782,6 +800,13 @@ int main(int argc, char** argv) {
         std::cout << "range  : " << options.startOffset << " .. " << scanEnd << "\n";
     } else {
         std::cout << "range  : unallocated clusters only\n";
+    }
+    if (!skipExtensions.empty()) {
+        std::cout << "skipping: ";
+        for (size_t index = 0; index < skipExtensions.size(); ++index) {
+            std::cout << (index > 0 ? ", " : "") << "." << skipExtensions[index];
+        }
+        std::cout << "\n";
     }
     std::cout << "chunk  : " << humanBytes(options.chunkSize) << "\n\n";
 

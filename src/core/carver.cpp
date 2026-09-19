@@ -151,6 +151,19 @@ CarveResult carveDevice(RawDevice& device,
         return result;
     }
 
+    std::vector<Signature> active;
+    active.reserve(signatures.size());
+    for (const auto& signature : signatures) {
+        if (!extensionSkipped(options.skipExtensions, signature.extension)) {
+            active.push_back(signature);
+        }
+    }
+    if (active.empty()) {
+        error = "every selected file type was skipped";
+        return result;
+    }
+    const std::vector<Signature>& candidates = active;
+
     const uint64_t deviceSize = device.size();
 
     std::vector<ByteRange> plan;
@@ -185,7 +198,7 @@ CarveResult carveDevice(RawDevice& device,
 
     const uint64_t chunkSize = std::max<uint64_t>(options.chunkSize, 64 * 1024);
     const size_t overlap = std::max<size_t>(
-        std::max(maxHeaderLength(signatures), maxLookahead(signatures)), 1);
+        std::max(maxHeaderLength(candidates), maxLookahead(candidates)), 1);
 
     std::vector<uint8_t> buffer(static_cast<size_t>(chunkSize));
 
@@ -223,7 +236,7 @@ CarveResult carveDevice(RawDevice& device,
         const Signature* found = nullptr;
         size_t foundIndex = 0;
 
-        for (const auto& signature : signatures) {
+        for (const auto& signature : candidates) {
             if (signature.headerOffset + signature.header.size() > got) {
                 continue;
             }

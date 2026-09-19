@@ -31,4 +31,13 @@ const std::vector<Signature>& defaultSignatures();
 size_t maxHeaderLength(const std::vector<Signature>& signatures);
 size_t maxLookahead(const std::vector<Signature>& signatures);
 
+// Splits a comma, semicolon or space separated list such as "jpeg, .PNG , pdf"
+// into lowercase extensions with the leading dot removed. Empty entries are
+// dropped, so an extension-less file can never be skipped by accident.
+std::vector<std::string> parseExtensionList(const std::string& text);
+
+// True when 'extension', given with or without a leading dot and in any case,
+// appears in a list produced by parseExtensionList.
+bool extensionSkipped(const std::vector<std::string>& skipped, const std::string& extension);
+
 }

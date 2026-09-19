@@ -12,6 +12,7 @@ namespace carver {
 struct RecoverOptions {
     uint64_t firstRecord = 1;
     bool includeDirectories = false;
+    std::vector<std::string> skipExtensions;
 };
 
 struct RecoveredFile {

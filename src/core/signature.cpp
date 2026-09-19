@@ -3,6 +3,7 @@
 #include "core/device.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 
 namespace carver {
@@ -850,6 +851,55 @@ size_t maxLookahead(const std::vector<Signature>& signatures) {
         longest = std::max(longest, signature.lookahead);
     }
     return longest;
+}
+
+std::vector<std::string> parseExtensionList(const std::string& text) {
+    std::vector<std::string> extensions;
+    std::string current;
+
+    const auto flush = [&extensions, &current]() {
+        size_t start = 0;
+        while (start < current.size() && current[start] == '.') {
+            ++start;
+        }
+        if (start < current.size()) {
+            extensions.push_back(current.substr(start));
+        }
+        current.clear();
+    };
+
+    for (char character : text) {
+        if (character == ',' || character == ';' || character == ' ' || character == '\t') {
+            flush();
+        } else {
+            current.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(character))));
+        }
+    }
+    flush();
+
+    return extensions;
+}
+
+bool extensionSkipped(const std::vector<std::string>& skipped, const std::string& extension) {
+    if (skipped.empty()) {
+        return false;
+    }
+
+    size_t start = 0;
+    while (start < extension.size() && extension[start] == '.') {
+        ++start;
+    }
+    if (start >= extension.size()) {
+        return false;
+    }
+
+    std::string normalized;
+    normalized.reserve(extension.size() - start);
+    for (size_t index = start; index < extension.size(); ++index) {
+        normalized.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(extension[index]))));
+    }
+
+    return std::find(skipped.begin(), skipped.end(), normalized) != skipped.end();
 }
 
 }

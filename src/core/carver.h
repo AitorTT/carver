@@ -27,6 +27,7 @@ struct CarveOptions {
     uint64_t endOffset = 0;
     uint64_t chunkSize = 8ull * 1024ull * 1024ull;
     std::vector<ByteRange> ranges;
+    std::vector<std::string> skipExtensions;
 };
 
 struct CarveResult {

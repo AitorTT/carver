@@ -397,6 +397,40 @@ if ($scanOutput -match 'possibly overwritten\s+:\s+1') {
     $failures += 'reported-risk'
 }
 
+# 9. --skip-ext drops files by their original extension
+Write-Host ''
+Write-Host '=== running --mft-recover with --skip-ext png,jpg ==='
+
+$skipDir = Join-Path $WorkDir 'recovered_skip'
+if (Test-Path -LiteralPath $skipDir) { Remove-Item -LiteralPath $skipDir -Recurse -Force }
+
+$previous = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try { $skipOutput = & $CarverExe $imagePath $skipDir --mft-recover --skip-ext png,jpg 2>&1 | Out-String }
+finally { $ErrorActionPreference = $previous }
+
+$skipCsv = Join-Path $skipDir 'recovered.csv'
+if (-not (Test-Path -LiteralPath $skipCsv)) {
+    Write-Host '  [FAIL] the skip run wrote no index'
+    $failures += 'skip-index'
+} else {
+    $skipRows = @(Import-Csv -LiteralPath $skipCsv)
+    $skipNames = @($skipRows | ForEach-Object { $_.original_name })
+    if ($skipNames.Count -eq 1 -and $skipNames[0] -eq 'notes.txt') {
+        Write-Host '  [ok]   only notes.txt survived --skip-ext png,jpg'
+    } else {
+        Write-Host ("  [FAIL] --skip-ext left {0} file(s): {1}" -f $skipNames.Count, ($skipNames -join ', '))
+        $failures += 'skip-ext'
+    }
+}
+
+if ($skipOutput -match 'skipping\s*:\s*\.png, \.jpg') {
+    Write-Host '  [ok]   the run reported what it was skipping'
+} else {
+    Write-Host '  [FAIL] the skipping line was not reported'
+    $failures += 'skip-report'
+}
+
 Write-Host ''
 if ($failures.Count -gt 0) {
     Write-Host ("FAILED: {0}" -f ($failures -join ', '))

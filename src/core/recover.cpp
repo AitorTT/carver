@@ -13,6 +13,17 @@ namespace carver {
 
 namespace {
 
+// The extension a name ends with, without the dot. A dot at the very end or a
+// name with no dot at all yields an empty string, matching how extensionSkipped
+// treats a missing extension.
+std::string nameExtension(const std::string& name) {
+    const size_t dot = name.find_last_of('.');
+    if (dot == std::string::npos || dot + 1 >= name.size()) {
+        return {};
+    }
+    return name.substr(dot + 1);
+}
+
 bool isClusterAllocated(const std::vector<uint8_t>& bitmap, uint64_t cluster) {
     const size_t index = static_cast<size_t>(cluster / 8);
     if (index >= bitmap.size()) {
@@ -317,7 +328,8 @@ RecoverResult recoverDeletedFiles(RawDevice& device,
                                   (options.includeDirectories || !entry.directory) &&
                                   entry.hasData &&
                                   !entry.name.empty() &&
-                                  entry.name.front() != '$';
+                                  entry.name.front() != '$' &&
+                                  !extensionSkipped(options.skipExtensions, nameExtension(entry.name));
 
             if (eligible) {
                 result.deletedFound += 1;

@@ -88,6 +88,7 @@ struct Job {
     uint64_t atRisk = 0;
     uint64_t recordsScanned = 0;
     uint64_t deletedFound = 0;
+    uint64_t loggedFiles = 0;
 
     void addLine(const std::string& line) {
         std::lock_guard<std::mutex> lock(mutex);
@@ -280,7 +281,10 @@ void logRecoveredFile(Job& job, const std::string& name, uint64_t size, bool ris
 void runJob(Job& job,
             const std::string& sourcePath,
             const std::string& outputDirectory,
-            Mode mode) {
+            Mode mode,
+            const std::string& skipExtensionText) {
+    const std::vector<std::string> skipExtensions = carver::parseExtensionList(skipExtensionText);
+
     job.running = true;
     job.finished = false;
     job.error.clear();
@@ -290,6 +294,7 @@ void runJob(Job& job,
     job.atRisk = 0;
     job.recordsScanned = 0;
     job.deletedFound = 0;
+    job.loggedFiles = 0;
 
     carver::RawDevice device;
     std::string error;
@@ -308,8 +313,24 @@ void runJob(Job& job,
     job.addLine("output: " + outputDirectory);
 
     const auto onProgress = [&job](const carver::Progress& state) {
-        std::lock_guard<std::mutex> lock(job.mutex);
-        job.progress = state;
+        std::string recoveredName;
+        {
+            std::lock_guard<std::mutex> lock(job.mutex);
+            job.progress = state;
+
+            // Report each file as it lands, so the log shows progress during the
+            // run rather than only in the summary at the end. addLine takes this
+            // same mutex, so the call itself has to happen outside the lock.
+            if (state.filesRecovered > job.loggedFiles && !state.currentOutput.empty()) {
+                job.loggedFiles = state.filesRecovered;
+                recoveredName = state.currentOutput;
+            }
+        }
+
+        if (!recoveredName.empty()) {
+            job.addLine("  " + recoveredName);
+        }
+
         return !job.cancel.load();
     };
 
@@ -333,6 +354,7 @@ void runJob(Job& job,
             job.addLine("filesystem: NTFS, " + std::to_string(volume.bytesPerCluster) + " byte clusters");
 
             carver::RecoverOptions options;
+            options.skipExtensions = skipExtensions;
             std::vector<carver::RecoveredFile> index;
 
             const carver::RecoverResult result = carver::recoverDeletedFiles(
@@ -354,6 +376,7 @@ void runJob(Job& job,
         }
     } else {
         carver::CarveOptions options;
+        options.skipExtensions = skipExtensions;
 
         if (mode == Mode::CarveFree) {
             carver::NtfsVolumeInfo volume;
@@ -412,6 +435,7 @@ struct UiState {
     int selectedVolume = -1;
     char imagePath[512] = {};
     char outputPath[512] = {};
+    char skipExtensions[256] = {};
     std::vector<carver::DriveInfo> drives;
     std::vector<carver::VolumeInfo> volumes;
     bool selectionInitialised = false;
@@ -543,6 +567,22 @@ void buildUi(UiState& ui, Job& job, Enumeration& enumeration) {
     ImGui::EndDisabled();
 
     ImGui::Spacing();
+    ImGui::TextUnformatted("Skip extensions");
+    ImGui::Separator();
+    ImGui::BeginDisabled(busy);
+    ImGui::SetNextItemWidth(-1);
+    ImGui::InputTextWithHint("##skipext", "e.g. epub, pdf   (empty recovers every type)",
+                             ui.skipExtensions, sizeof(ui.skipExtensions));
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Case insensitive; a leading dot is optional.\n"
+                          "MFT mode matches the original file name, so '.epub' really\n"
+                          "skips EPUB books. Carving only sees headers, and EPUB, DOCX,\n"
+                          "APK and JAR all share the zip signature, so carving cannot\n"
+                          "tell them apart from a zip.");
+    }
+    ImGui::EndDisabled();
+
+    ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
 
@@ -620,9 +660,10 @@ void buildUi(UiState& ui, Job& job, Enumeration& enumeration) {
             job.cancel.store(false);
             const std::string source = resolvedSource;
             const std::string output = ui.outputPath;
+            const std::string skip = ui.skipExtensions;
             const Mode mode = ui.mode;
-            job.worker = std::thread([&job, source, output, mode] {
-                runJob(job, source, output, mode);
+            job.worker = std::thread([&job, source, output, mode, skip] {
+                runJob(job, source, output, mode, skip);
             });
         }
         ImGui::EndDisabled();
