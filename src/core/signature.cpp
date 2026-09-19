@@ -853,17 +853,46 @@ size_t maxLookahead(const std::vector<Signature>& signatures) {
     return longest;
 }
 
+namespace {
+
+// Lowercase with the dot removed, and common spellings folded together so that
+// "jpeg" and "jpg" refer to the same thing in both directions. Without this a
+// user asking for "jpeg" would silently match nothing, because the carve
+// signature for that format is called "jpg".
+std::string canonicalExtension(const std::string& value) {
+    size_t start = 0;
+    while (start < value.size() && value[start] == '.') {
+        ++start;
+    }
+
+    std::string result;
+    result.reserve(value.size() - start);
+    for (size_t index = start; index < value.size(); ++index) {
+        result.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(value[index]))));
+    }
+
+    if (result == "jpeg" || result == "jpe") {
+        return "jpg";
+    }
+    if (result == "tiff") {
+        return "tif";
+    }
+    if (result == "gzip") {
+        return "gz";
+    }
+    return result;
+}
+
+}
+
 std::vector<std::string> parseExtensionList(const std::string& text) {
     std::vector<std::string> extensions;
     std::string current;
 
     const auto flush = [&extensions, &current]() {
-        size_t start = 0;
-        while (start < current.size() && current[start] == '.') {
-            ++start;
-        }
-        if (start < current.size()) {
-            extensions.push_back(current.substr(start));
+        const std::string normalized = canonicalExtension(current);
+        if (!normalized.empty()) {
+            extensions.push_back(normalized);
         }
         current.clear();
     };
@@ -872,7 +901,7 @@ std::vector<std::string> parseExtensionList(const std::string& text) {
         if (character == ',' || character == ';' || character == ' ' || character == '\t') {
             flush();
         } else {
-            current.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(character))));
+            current.push_back(character);
         }
     }
     flush();
@@ -885,21 +914,27 @@ bool extensionSkipped(const std::vector<std::string>& skipped, const std::string
         return false;
     }
 
-    size_t start = 0;
-    while (start < extension.size() && extension[start] == '.') {
-        ++start;
-    }
-    if (start >= extension.size()) {
+    const std::string normalized = canonicalExtension(extension);
+    if (normalized.empty()) {
+        // An extension-less file is never skipped, so a stray empty entry in the
+        // skip list cannot quietly drop files that have no extension at all.
         return false;
     }
 
-    std::string normalized;
-    normalized.reserve(extension.size() - start);
-    for (size_t index = start; index < extension.size(); ++index) {
-        normalized.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(extension[index]))));
+    return std::find(skipped.begin(), skipped.end(), normalized) != skipped.end();
+}
+
+bool extensionSelected(const std::vector<std::string>& selected, const std::string& extension) {
+    if (selected.empty()) {
+        return true;
     }
 
-    return std::find(skipped.begin(), skipped.end(), normalized) != skipped.end();
+    const std::string normalized = canonicalExtension(extension);
+    if (normalized.empty()) {
+        return false;
+    }
+
+    return std::find(selected.begin(), selected.end(), normalized) != selected.end();
 }
 
 }

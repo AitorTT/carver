@@ -283,8 +283,10 @@ void runJob(Job& job,
             const std::string& outputDirectory,
             Mode mode,
             const std::string& skipExtensionText,
+            const std::string& onlyExtensionText,
             bool listOnly) {
     const std::vector<std::string> skipExtensions = carver::parseExtensionList(skipExtensionText);
+    const std::vector<std::string> onlyExtensions = carver::parseExtensionList(onlyExtensionText);
 
     job.running = true;
     job.finished = false;
@@ -358,6 +360,7 @@ void runJob(Job& job,
 
             carver::RecoverOptions options;
             options.skipExtensions = skipExtensions;
+            options.onlyExtensions = onlyExtensions;
             options.listOnly = listOnly;
             std::vector<carver::RecoveredFile> index;
 
@@ -381,6 +384,7 @@ void runJob(Job& job,
     } else {
         carver::CarveOptions options;
         options.skipExtensions = skipExtensions;
+        options.onlyExtensions = onlyExtensions;
         options.listOnly = listOnly;
 
         if (mode == Mode::CarveFree) {
@@ -443,6 +447,7 @@ struct UiState {
     char imagePath[512] = {};
     char outputPath[512] = {};
     char skipExtensions[256] = {};
+    char onlyExtensions[256] = {};
     bool listOnly = true;
     std::vector<carver::DriveInfo> drives;
     std::vector<carver::VolumeInfo> volumes;
@@ -585,18 +590,30 @@ void buildUi(UiState& ui, Job& job, Enumeration& enumeration) {
     ImGui::EndDisabled();
 
     ImGui::Spacing();
-    ImGui::TextUnformatted("Skip extensions");
+    ImGui::TextUnformatted("Extensions");
     ImGui::Separator();
     ImGui::BeginDisabled(busy);
-    ImGui::SetNextItemWidth(-1);
-    ImGui::InputTextWithHint("##skipext", "e.g. epub, pdf   (empty recovers every type)",
-                             ui.skipExtensions, sizeof(ui.skipExtensions));
+    ImGui::SetNextItemWidth(-140);
+    ImGui::InputTextWithHint("##onlyext", "recover only these, e.g. jpg, png",
+                             ui.onlyExtensions, sizeof(ui.onlyExtensions));
+    ImGui::SameLine();
+    ImGui::TextDisabled("(empty = every type)");
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Case insensitive; a leading dot is optional.\n"
+        ImGui::SetTooltip("Leave empty to handle every type. jpeg, tiff and gzip are\n"
+                          "accepted as aliases of jpg, tif and gz.");
+    }
+    ImGui::SetNextItemWidth(-140);
+    ImGui::InputTextWithHint("##skipext", "skip these, e.g. epub, pdf",
+                             ui.skipExtensions, sizeof(ui.skipExtensions));
+    ImGui::SameLine();
+    ImGui::TextDisabled("(empty = skip nothing)");
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Case insensitive; a leading dot is optional. Skip wins if both\n"
+                          "fields name the same type.\n"
                           "MFT mode matches the original file name, so '.epub' really\n"
                           "skips EPUB books. Carving only sees headers, and EPUB, DOCX,\n"
                           "APK and JAR all share the zip signature, so carving cannot\n"
-                           "tell them apart from a zip.");
+                          "tell them apart from a zip.");
     }
     ImGui::EndDisabled();
 
@@ -691,10 +708,11 @@ void buildUi(UiState& ui, Job& job, Enumeration& enumeration) {
             const std::string source = resolvedSource;
             const std::string output = ui.outputPath;
             const std::string skip = ui.skipExtensions;
+            const std::string only = ui.onlyExtensions;
             const Mode mode = ui.mode;
             const bool listOnly = ui.listOnly;
-            job.worker = std::thread([&job, source, output, mode, skip, listOnly] {
-                runJob(job, source, output, mode, skip, listOnly);
+            job.worker = std::thread([&job, source, output, mode, skip, only, listOnly] {
+                runJob(job, source, output, mode, skip, only, listOnly);
             });
         }
         ImGui::EndDisabled();

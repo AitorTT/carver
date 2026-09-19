@@ -35,6 +35,9 @@ void printUsage() {
         "                    Applies to carving and to --mft-recover. In carve modes\n"
         "                    an extension matches a signature type, so skipping zip\n"
         "                    also skips epub, docx, apk and jar.\n"
+        "  --only-ext <list> the opposite: handle only these extensions, e.g. jpg,png.\n"
+        "                    jpeg, tiff and gzip are accepted as aliases of jpg, tif\n"
+        "                    and gz. --skip-ext wins when both name the same type.\n"
         "  --list-only       report each file and its size without writing anything\n"
         "  --free-only       scan only unallocated NTFS clusters, using $Bitmap\n"
         "                    (input must be an NTFS volume, e.g. \\\\.\\D:)\n"
@@ -545,6 +548,7 @@ int main(int argc, char** argv) {
     bool listOnly = false;
     std::string partitionSelection;
     std::vector<std::string> skipExtensions;
+    std::vector<std::string> onlyExtensions;
 
     for (size_t index = 2; index < args.size(); ++index) {
         const std::string& flag = args[index];
@@ -574,6 +578,8 @@ int main(int argc, char** argv) {
             partitionSelection = args[++index];
         } else if (flag == "--skip-ext") {
             skipExtensions = carver::parseExtensionList(args[++index]);
+        } else if (flag == "--only-ext") {
+            onlyExtensions = carver::parseExtensionList(args[++index]);
         } else {
             std::cerr << "error: unknown option " << flag << "\n";
             return 1;
@@ -581,7 +587,19 @@ int main(int argc, char** argv) {
     }
 
     options.skipExtensions = skipExtensions;
+    options.onlyExtensions = onlyExtensions;
     options.listOnly = listOnly;
+
+    const auto printExtensions = [](const char* label, const std::vector<std::string>& list) {
+        if (list.empty()) {
+            return;
+        }
+        std::cout << label << ": ";
+        for (size_t index = 0; index < list.size(); ++index) {
+            std::cout << (index > 0 ? ", " : "") << "." << list[index];
+        }
+        std::cout << "\n";
+    };
 
     const std::string inputPath = args[0];
     const std::string outputDirectory = args[1];
@@ -721,13 +739,8 @@ int main(int argc, char** argv) {
 
         std::cout << "mft records: " << recordCount << "\n";
         std::cout << "output     : " << outputDirectory << "\n";
-        if (!skipExtensions.empty()) {
-            std::cout << "skipping   : ";
-            for (size_t index = 0; index < skipExtensions.size(); ++index) {
-                std::cout << (index > 0 ? ", " : "") << "." << skipExtensions[index];
-            }
-            std::cout << "\n";
-        }
+        printExtensions("only       ", onlyExtensions);
+        printExtensions("skipping   ", skipExtensions);
         std::cout << "\n";
 
         uint64_t listed = 0;
@@ -758,6 +771,7 @@ int main(int argc, char** argv) {
 
         carver::RecoverOptions recoverOptions;
         recoverOptions.skipExtensions = skipExtensions;
+        recoverOptions.onlyExtensions = onlyExtensions;
         recoverOptions.listOnly = listOnly;
         std::vector<carver::RecoveredFile> index;
 
@@ -822,13 +836,8 @@ int main(int argc, char** argv) {
     } else {
         std::cout << "range  : unallocated clusters only\n";
     }
-    if (!skipExtensions.empty()) {
-        std::cout << "skipping: ";
-        for (size_t index = 0; index < skipExtensions.size(); ++index) {
-            std::cout << (index > 0 ? ", " : "") << "." << skipExtensions[index];
-        }
-        std::cout << "\n";
-    }
+    printExtensions("only   ", onlyExtensions);
+    printExtensions("skipping", skipExtensions);
     std::cout << "chunk  : " << humanBytes(options.chunkSize) << "\n\n";
 
     const auto& signatures = carver::defaultSignatures();

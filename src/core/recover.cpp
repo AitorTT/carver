@@ -323,13 +323,15 @@ RecoverResult recoverDeletedFiles(RawDevice& device,
         std::string ignored;
 
         if (readMftEntryFull(device, info, recordNumber, entry, ignored)) {
+            const std::string extension = nameExtension(entry.name);
             const bool eligible = !entry.inUse &&
                                   entry.baseRecordReference == 0 &&
                                   (options.includeDirectories || !entry.directory) &&
                                   entry.hasData &&
                                   !entry.name.empty() &&
                                   entry.name.front() != '$' &&
-                                  !extensionSkipped(options.skipExtensions, nameExtension(entry.name));
+                                  extensionSelected(options.onlyExtensions, extension) &&
+                                  !extensionSkipped(options.skipExtensions, extension);
 
             if (eligible) {
                 result.deletedFound += 1;

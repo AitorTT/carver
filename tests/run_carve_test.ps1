@@ -389,6 +389,47 @@ if ($listOutput -match ('files listed\s+:\s+' + $recovered.Count)) {
     $failures += 'list-count'
 }
 
+# --only-ext keeps just the named types. "jpeg" is deliberate here: the carve
+# signature for it is called "jpg", so this also checks that aliases fold.
+Write-Host ''
+Write-Host '=== carving again, only jpg and gif ==='
+
+$onlyDir = Join-Path $WorkDir 'recovered_only'
+if (Test-Path -LiteralPath $onlyDir) { Remove-Item -LiteralPath $onlyDir -Recurse -Force }
+
+$previous = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try { $onlyOutput = & $CarverExe $imagePath $onlyDir --chunk $ChunkSize --only-ext jpeg,gif 2>&1 | Out-String }
+finally { $ErrorActionPreference = $previous }
+if ($LASTEXITCODE -ne 0) { throw "carver-cli exited with $LASTEXITCODE" }
+
+$onlyRecovered = @(Get-ChildItem -LiteralPath $onlyDir -File)
+$onlyHashes = @{}
+foreach ($file in $onlyRecovered) { $onlyHashes[(Get-Sha256 $file.FullName)] = $file.Name }
+
+foreach ($case in @(@{ Name = 'jpeg'; Path = $jpegPath }, @{ Name = 'gif'; Path = $gifPath })) {
+    if ($onlyHashes.ContainsKey((Get-Sha256 $case.Path))) {
+        Write-Host ("  [ok]   {0,-5} kept by --only-ext" -f $case.Name)
+    } else {
+        Write-Host ("  [FAIL] {0,-5} missing although --only-ext asked for it" -f $case.Name)
+        $failures += ("only-" + $case.Name)
+    }
+}
+
+if ($onlyRecovered.Count -eq 2) {
+    Write-Host '  [ok]   nothing else was carved'
+} else {
+    Write-Host ("  [FAIL] --only-ext carved {0} files, expected 2" -f $onlyRecovered.Count)
+    $failures += 'only-count'
+}
+
+if ($onlyOutput -match 'only\s*:\s*\.jpg, \.gif') {
+    Write-Host '  [ok]   the only-list was reported, with jpeg folded onto jpg'
+} else {
+    Write-Host '  [FAIL] the only-list line was not reported as expected'
+    $failures += 'only-report'
+}
+
 Write-Host ''
 if ($failures.Count -gt 0) {
     Write-Host ("FAILED: {0}" -f ($failures -join ', '))

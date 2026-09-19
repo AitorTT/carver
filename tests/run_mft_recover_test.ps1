@@ -473,6 +473,32 @@ if ($listOutput -match 'files listed\s+:\s+3') {
     $failures += 'list-count'
 }
 
+# 11. --only-ext keeps just the named types
+Write-Host ''
+Write-Host '=== running --mft-recover with --only-ext txt ==='
+
+$onlyDir = Join-Path $WorkDir 'recovered_only'
+if (Test-Path -LiteralPath $onlyDir) { Remove-Item -LiteralPath $onlyDir -Recurse -Force }
+
+$previous = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try { $onlyOutput = & $CarverExe $imagePath $onlyDir --mft-recover --only-ext txt 2>&1 | Out-String }
+finally { $ErrorActionPreference = $previous }
+
+$onlyCsv = Join-Path $onlyDir 'recovered.csv'
+if (Test-Path -LiteralPath $onlyCsv) {
+    $onlyNames = @(Import-Csv -LiteralPath $onlyCsv | ForEach-Object { $_.original_name })
+    if ($onlyNames.Count -eq 1 -and $onlyNames[0] -eq 'notes.txt') {
+        Write-Host '  [ok]   --only-ext txt left just notes.txt'
+    } else {
+        Write-Host ("  [FAIL] --only-ext txt left {0} file(s): {1}" -f $onlyNames.Count, ($onlyNames -join ', '))
+        $failures += 'only-ext'
+    }
+} else {
+    Write-Host '  [FAIL] the only run wrote no index'
+    $failures += 'only-index'
+}
+
 Write-Host ''
 if ($failures.Count -gt 0) {
     Write-Host ("FAILED: {0}" -f ($failures -join ', '))

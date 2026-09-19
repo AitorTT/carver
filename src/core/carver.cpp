@@ -166,12 +166,14 @@ CarveResult carveDevice(RawDevice& device,
     std::vector<Signature> active;
     active.reserve(signatures.size());
     for (const auto& signature : signatures) {
-        if (!extensionSkipped(options.skipExtensions, signature.extension)) {
+        if (extensionSelected(options.onlyExtensions, signature.extension) &&
+            !extensionSkipped(options.skipExtensions, signature.extension)) {
             active.push_back(signature);
         }
     }
     if (active.empty()) {
-        error = "every selected file type was skipped";
+        error = options.onlyExtensions.empty() ? "every selected file type was skipped"
+                                               : "none of the requested file types matched a signature";
         return result;
     }
     const std::vector<Signature>& candidates = active;

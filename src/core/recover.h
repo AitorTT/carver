@@ -14,6 +14,7 @@ struct RecoverOptions {
     bool includeDirectories = false;
     bool listOnly = false;
     std::vector<std::string> skipExtensions;
+    std::vector<std::string> onlyExtensions;
 };
 
 struct RecoveredFile {
