@@ -2,6 +2,7 @@
 #include "core/device.h"
 #include "core/device_enum.h"
 #include "core/fat.h"
+#include "core/fat_recover.h"
 #include "core/i30.h"
 #include "core/image.h"
 #include "core/lznt1.h"
@@ -39,10 +40,14 @@ void printUsage() {
         "                    jpeg, tiff and gzip are accepted as aliases of jpg, tif\n"
         "                    and gz. --skip-ext wins when both name the same type.\n"
         "  --list-only       report each file and its size without writing anything\n"
-        "  --free-only       scan only unallocated NTFS clusters, using $Bitmap\n"
-        "                    (input must be an NTFS volume, e.g. \\\\.\\D:)\n"
+        "  --free-only       scan only unallocated clusters: an NTFS volume uses\n"
+        "                    $Bitmap, a FAT12/16/32 or exFAT volume its allocation\n"
+        "                    table (input must be a volume, e.g. \\\\.\\D:)\n"
         "  --mft-recover     recover deleted files by name from deleted $MFT records\n"
         "                    (input must be an NTFS volume)\n"
+        "  --fat-recover     recover deleted files by name from FAT12/16/32 directory\n"
+        "                    entries, including long file names (input must be FAT;\n"
+        "                    exFAT volumes have no name entries, use --free-only)\n"
         "  --i30 <input> <output.csv>   list every name found in the NTFS directory\n"
         "                    indexes, including names left in index slack\n"
         "  --lznt1 <input> <output>     decompress a raw LZNT1 stream\n"
@@ -545,6 +550,7 @@ int main(int argc, char** argv) {
     carver::CarveOptions options;
     bool freeOnly = false;
     bool mftRecover = false;
+    bool fatRecover = false;
     bool listOnly = false;
     std::string partitionSelection;
     std::vector<std::string> skipExtensions;
@@ -558,6 +564,10 @@ int main(int argc, char** argv) {
         }
         if (flag == "--mft-recover") {
             mftRecover = true;
+            continue;
+        }
+        if (flag == "--fat-recover") {
+            fatRecover = true;
             continue;
         }
         if (flag == "--list-only") {
@@ -620,9 +630,9 @@ int main(int argc, char** argv) {
     uint64_t partitionSize = device.size();
     bool partitionResolved = false;
 
-    const bool needsNtfsBase = freeOnly || mftRecover || !partitionSelection.empty();
+    const bool needsVolumeBase = freeOnly || mftRecover || fatRecover || !partitionSelection.empty();
 
-    if (needsNtfsBase) {
+    if (needsVolumeBase) {
         bool resolvedAtZero = false;
 
         if (partitionSelection.empty()) {
@@ -646,7 +656,8 @@ int main(int argc, char** argv) {
 
         if (!resolvedAtZero) {
             carver::PartitionResolution resolution;
-            if (!carver::resolveNtfsBase(device, partitionSelection, resolution, error)) {
+            if (!carver::resolveNtfsBase(device, partitionSelection, resolution, error,
+                                         freeOnly || fatRecover)) {
                 std::cerr << "error: " << error << "\n";
                 return 1;
             }
@@ -666,12 +677,12 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (!partitionSelection.empty() && !needsNtfsBase) {
+    if (!partitionSelection.empty() && !needsVolumeBase) {
         options.startOffset = partitionOffset;
         options.endOffset = partitionOffset + partitionSize;
     }
 
-    if (freeOnly || mftRecover) {
+    if (freeOnly || mftRecover || fatRecover) {
         if (!partitionResolved) {
             std::cerr << "error: cannot work out which volume to use\n";
             return 1;
@@ -687,6 +698,11 @@ int main(int argc, char** argv) {
         usingNtfs = carver::parseNtfsBootSector(bootSector.data(), got, volume, error);
 
         if (usingNtfs) {
+            if (fatRecover) {
+                std::cerr << "error: --fat-recover needs a FAT volume, but the input is NTFS\n";
+                return 1;
+            }
+
             volume.baseOffset = partitionOffset;
             if (!carver::readBitmap(device, volume, bitmap, error)) {
                 std::cerr << "error: cannot read $Bitmap: " << error << "\n";
@@ -696,7 +712,7 @@ int main(int argc, char** argv) {
             std::cout << "filesystem : NTFS, " << volume.bytesPerCluster << " byte clusters\n";
             std::cout << "clusters   : " << volume.totalClusters() << "\n";
             std::cout << "bitmap     : " << bitmap.size() << " bytes\n";
-        } else if (freeOnly) {
+        } else if (freeOnly || fatRecover) {
             std::string fatError;
             if (!carver::parseFatBootSector(bootSector.data(), got, fatVolume, fatError)) {
                 std::cerr << "error: unrecognised volume.\n";
@@ -710,10 +726,12 @@ int main(int argc, char** argv) {
             std::cout << "filesystem : " << carver::describeFatKind(fatVolume.kind)
                       << ", " << fatVolume.bytesPerCluster << " byte clusters\n";
             std::cout << "clusters   : " << fatVolume.clusterCount << "\n";
-            std::cout << "allocation : "
-                      << (fatVolume.kind == carver::FatKind::ExFat ? "exFAT allocation bitmap"
-                                                                   : "FAT table")
-                      << "\n";
+            if (freeOnly) {
+                std::cout << "allocation : "
+                          << (fatVolume.kind == carver::FatKind::ExFat ? "exFAT allocation bitmap"
+                                                                       : "FAT table")
+                          << "\n";
+            }
         } else {
             std::cerr << "error: --mft-recover needs an NTFS volume: " << error << "\n";
             return 1;
@@ -785,6 +803,67 @@ int main(int argc, char** argv) {
         }
 
         std::cout << "records scanned : " << recovered.recordsScanned << "\n";
+        std::cout << "deleted entries : " << recovered.deletedFound << "\n";
+        std::cout << (listOnly ? "files listed    : " : "files written   : ")
+                  << recovered.filesWritten << "\n";
+        std::cout << (listOnly ? "bytes listed    : " : "bytes written   : ")
+                  << humanBytes(recovered.bytesWritten) << "\n";
+        std::cout << "possibly overwritten : " << recovered.atRisk << "\n";
+        std::cout << "index           : " << outputDirectory << "\\recovered.csv\n";
+        if (recovered.cancelled) {
+            std::cout << "cancelled\n";
+        }
+        return 0;
+    }
+
+    if (fatRecover) {
+        std::cout << "output     : " << outputDirectory << "\n";
+        printExtensions("only       ", onlyExtensions);
+        printExtensions("skipping   ", skipExtensions);
+        std::cout << "\n";
+
+        uint64_t listed = 0;
+        const auto fatProgress = [listOnly, &listed](const carver::Progress& state) {
+            if (listOnly) {
+                if (state.filesRecovered > listed && !state.currentOutput.empty()) {
+                    listed = state.filesRecovered;
+                    std::printf("  %-44s %10s\n", state.currentOutput.c_str(),
+                                humanBytes(state.currentSize).c_str());
+                    std::fflush(stdout);
+                }
+                return true;
+            }
+
+            const double percent = state.bytesTotal == 0
+                                        ? 100.0
+                                        : (static_cast<double>(state.bytesScanned) /
+                                           static_cast<double>(state.bytesTotal)) * 100.0;
+            std::printf("\r[%5.1f%%] cluster %llu  %4llu files  %10s written  %-24s",
+                        percent,
+                        static_cast<unsigned long long>(state.bytesScanned),
+                        static_cast<unsigned long long>(state.filesRecovered),
+                        humanBytes(state.bytesRecovered).c_str(),
+                        state.currentOutput.c_str());
+            std::fflush(stdout);
+            return true;
+        };
+
+        carver::RecoverOptions recoverOptions;
+        recoverOptions.skipExtensions = skipExtensions;
+        recoverOptions.onlyExtensions = onlyExtensions;
+        recoverOptions.listOnly = listOnly;
+        std::vector<carver::RecoveredFile> index;
+
+        const carver::RecoverResult recovered = carver::recoverDeletedFatFiles(
+            device, fatVolume, outputDirectory, recoverOptions, fatProgress, index, error);
+
+        std::printf("\n\n");
+
+        if (!error.empty()) {
+            std::cerr << "error: " << error << "\n";
+        }
+
+        std::cout << "entries scanned : " << recovered.recordsScanned << "\n";
         std::cout << "deleted entries : " << recovered.deletedFound << "\n";
         std::cout << (listOnly ? "files listed    : " : "files written   : ")
                   << recovered.filesWritten << "\n";

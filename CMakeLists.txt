@@ -15,6 +15,8 @@ else()
   add_compile_options(-Wall -Wextra)
 endif()
 
+add_compile_definitions(NOMINMAX)
+
 add_library(carver_core STATIC
   src/core/device.cpp
   src/core/device_enum.cpp
@@ -27,6 +29,8 @@ add_library(carver_core STATIC
   src/core/recover.cpp
   src/core/signature.cpp
   src/core/carver.cpp
+  src/core/recover_common.cpp
+  src/core/fat_recover.cpp
 )
 
 target_include_directories(carver_core PUBLIC src)

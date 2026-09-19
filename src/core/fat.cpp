@@ -135,7 +135,7 @@ std::vector<ByteRange> fatTableFreeRanges(RawDevice& device, const FatVolumeInfo
         allocated[static_cast<size_t>(index)] = entry != 0;
     }
 
-    return rangesFromAllocated(allocated, info.dataStart, info.bytesPerCluster);
+    return rangesFromAllocated(allocated, info.baseOffset + info.dataStart, info.bytesPerCluster);
 }
 
 std::vector<ByteRange> exFatBitmapFreeRanges(RawDevice& device, const FatVolumeInfo& info,
@@ -145,7 +145,7 @@ std::vector<ByteRange> exFatBitmapFreeRanges(RawDevice& device, const FatVolumeI
         return {};
     }
 
-    const uint64_t rootOffset = info.dataStart +
+    const uint64_t rootOffset = info.baseOffset + info.dataStart +
                                static_cast<uint64_t>(rootCluster - 2) * info.bytesPerCluster;
     const uint64_t probe = std::min<uint64_t>(ROOT_DIRECTORY_PROBE,
                                              static_cast<uint64_t>(info.bytesPerCluster) * 64);
@@ -182,7 +182,7 @@ std::vector<ByteRange> exFatBitmapFreeRanges(RawDevice& device, const FatVolumeI
         bitmapLength = expected;
     }
 
-    const uint64_t bitmapOffset = info.dataStart +
+    const uint64_t bitmapOffset = info.baseOffset + info.dataStart +
                                  static_cast<uint64_t>(bitmapCluster - 2) * info.bytesPerCluster;
 
     std::vector<uint8_t> bitmap;
@@ -252,8 +252,8 @@ bool parseFatBootSector(const uint8_t* sector, size_t length, FatVolumeInfo& inf
             return false;
         }
 
-        info.dataStart = info.baseOffset +
-                         static_cast<uint64_t>(clusterHeapOffset) * info.bytesPerSector;
+        info.dataStart = static_cast<uint64_t>(clusterHeapOffset) * info.bytesPerSector;
+        info.rootCluster = rootCluster;
 
         return true;
     }
@@ -315,9 +315,15 @@ bool parseFatBootSector(const uint8_t* sector, size_t length, FatVolumeInfo& inf
     info.bytesPerSector = bytesPerSector;
     info.bytesPerCluster = static_cast<uint32_t>(bytesPerSector) * sectorsPerCluster;
     info.clusterCount = clusters;
-    info.dataStart = info.baseOffset +
-                     (static_cast<uint64_t>(reservedSectors) +
-                      static_cast<uint64_t>(fatCount) * fatSize + rootDirSectors) * bytesPerSector;
+    info.fatOffsetSectors = reservedSectors;
+    info.fatSizeSectors = fatSize;
+    info.fatCount = fatCount;
+    info.rootEntryCount = rootEntries;
+    info.rootDirStart = (static_cast<uint64_t>(reservedSectors) +
+                         static_cast<uint64_t>(fatCount) * fatSize) * bytesPerSector;
+    info.rootDirSectors = rootDirSectors;
+    info.rootCluster = readU32(sector + 0x2C) & 0x0FFFFFFFu;
+    info.dataStart = info.rootDirStart + rootDirSectors * bytesPerSector;
 
     return true;
 }

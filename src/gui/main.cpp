@@ -19,6 +19,8 @@
 #include "core/carver.h"
 #include "core/device.h"
 #include "core/device_enum.h"
+#include "core/fat.h"
+#include "core/fat_recover.h"
 #include "core/ntfs.h"
 #include "core/recover.h"
 #include "core/signature.h"
@@ -35,7 +37,7 @@ HWND g_window = nullptr;
 bool g_resizePending = false;
 
 enum class SourceKind { Volume, PhysicalDrive, ImageFile };
-enum class Mode { CarveWhole, CarveFree, MftRecover };
+enum class Mode { CarveWhole, CarveFree, MftRecover, FatRecover };
 
 struct Enumeration {
     std::mutex mutex;
@@ -381,6 +383,46 @@ void runJob(Job& job,
                 logRecoveredFile(job, file.originalName + "  ->  " + file.outputName, file.size, file.overwriteRisk);
             }
         }
+    } else if (mode == Mode::FatRecover) {
+        carver::FatVolumeInfo volume;
+        std::vector<uint8_t> bootSector(512, 0);
+        uint32_t got = 0;
+
+        if (!device.readAt(0, bootSector.data(), 512, got, error) || got < 512) {
+            job.error = "cannot read boot sector: " + error;
+        } else if (!carver::parseFatBootSector(bootSector.data(), got, volume, error)) {
+            job.error = "not a FAT volume: " + error;
+        } else if (volume.kind == carver::FatKind::ExFat) {
+            job.error = "exFAT stores no file names; use the unallocated-space mode instead";
+        }
+
+        if (job.error.empty()) {
+            job.addLine(std::string("filesystem: ") + carver::describeFatKind(volume.kind) + ", " +
+                        std::to_string(volume.bytesPerCluster) + " byte clusters");
+
+            carver::RecoverOptions options;
+            options.skipExtensions = skipExtensions;
+            options.onlyExtensions = onlyExtensions;
+            options.listOnly = listOnly;
+            std::vector<carver::RecoveredFile> index;
+
+            const carver::RecoverResult result = carver::recoverDeletedFatFiles(
+                device, volume, outputDirectory, options, onProgress, index, error);
+
+            if (!error.empty()) {
+                job.error = error;
+            }
+
+            job.recordsScanned = result.recordsScanned;
+            job.deletedFound = result.deletedFound;
+            job.filesWritten = result.filesWritten;
+            job.bytesWritten = result.bytesWritten;
+            job.atRisk = result.atRisk;
+
+            for (const auto& file : index) {
+                logRecoveredFile(job, file.originalName + "  ->  " + file.outputName, file.size, file.overwriteRisk);
+            }
+        }
     } else {
         carver::CarveOptions options;
         options.skipExtensions = skipExtensions;
@@ -389,22 +431,36 @@ void runJob(Job& job,
 
         if (mode == Mode::CarveFree) {
             carver::NtfsVolumeInfo volume;
+            carver::FatVolumeInfo fatVolume;
             std::vector<uint8_t> bootSector(512, 0);
             uint32_t got = 0;
+            std::string ntfsError;
+            std::string fatError;
 
             if (!device.readAt(0, bootSector.data(), 512, got, error) || got < 512) {
                 job.error = "cannot read boot sector: " + error;
-            } else if (!carver::parseNtfsBootSector(bootSector.data(), got, volume, error)) {
-                job.error = "not an NTFS volume: " + error;
-            }
-
-            std::vector<uint8_t> bitmap;
-            if (job.error.empty() && !carver::readBitmap(device, volume, bitmap, error)) {
-                job.error = "cannot read the cluster bitmap: " + error;
+            } else if (carver::parseNtfsBootSector(bootSector.data(), got, volume, ntfsError)) {
+                std::vector<uint8_t> bitmap;
+                if (!carver::readBitmap(device, volume, bitmap, error)) {
+                    job.error = "cannot read the cluster bitmap: " + error;
+                } else {
+                    options.ranges = carver::freeClusterRanges(bitmap, volume.totalClusters(),
+                                                               volume.bytesPerCluster);
+                    job.addLine("filesystem: NTFS");
+                }
+            } else if (carver::parseFatBootSector(bootSector.data(), got, fatVolume, fatError)) {
+                std::string rangeError;
+                options.ranges = carver::fatFreeRanges(device, fatVolume, rangeError);
+                if (!rangeError.empty()) {
+                    job.error = rangeError;
+                } else {
+                    job.addLine(std::string("filesystem: ") + carver::describeFatKind(fatVolume.kind));
+                }
+            } else {
+                job.error = "not an NTFS or FAT volume: " + ntfsError;
             }
 
             if (job.error.empty()) {
-                options.ranges = carver::freeClusterRanges(bitmap, volume.totalClusters(), volume.bytesPerCluster);
                 job.addLine("unallocated extents: " + std::to_string(options.ranges.size()));
                 if (options.ranges.empty()) {
                     job.error = "no unallocated clusters found";
@@ -581,7 +637,10 @@ void buildUi(UiState& ui, Job& job, Enumeration& enumeration) {
     if (ImGui::RadioButton("Recover deleted files by name (NTFS)", ui.mode == Mode::MftRecover)) {
         ui.mode = Mode::MftRecover;
     }
-    if (ImGui::RadioButton("Carve signatures from unallocated space (NTFS)", ui.mode == Mode::CarveFree)) {
+    if (ImGui::RadioButton("Recover deleted files by name (FAT12/16/32)", ui.mode == Mode::FatRecover)) {
+        ui.mode = Mode::FatRecover;
+    }
+    if (ImGui::RadioButton("Carve signatures from unallocated space (NTFS/FAT)", ui.mode == Mode::CarveFree)) {
         ui.mode = Mode::CarveFree;
     }
     if (ImGui::RadioButton("Carve signatures from the whole source", ui.mode == Mode::CarveWhole)) {
@@ -634,14 +693,14 @@ void buildUi(UiState& ui, Job& job, Enumeration& enumeration) {
     ImGui::Spacing();
 
     std::string resolvedSource;
-    bool targetIsNtfsVolume = false;
+    std::string targetFileSystem;
     bool targetRotational = true;
 
     if (ui.source == SourceKind::Volume) {
         if (ui.selectedVolume >= 0 && ui.selectedVolume < static_cast<int>(ui.volumes.size())) {
             const auto& volume = ui.volumes[ui.selectedVolume];
             resolvedSource = volume.devicePath;
-            targetIsNtfsVolume = volume.fileSystem == "NTFS";
+            targetFileSystem = volume.fileSystem;
             targetRotational = volume.rotational;
         }
     } else if (ui.source == SourceKind::PhysicalDrive) {
@@ -653,17 +712,31 @@ void buildUi(UiState& ui, Job& job, Enumeration& enumeration) {
         resolvedSource = ui.imagePath;
     }
 
-    const bool needsNtfsVolume = ui.mode != Mode::CarveWhole;
+    const bool needsVolume = ui.mode != Mode::CarveWhole;
 
-    if (needsNtfsVolume && !resolvedSource.empty() && !targetIsNtfsVolume) {
-        const char* reason = ui.source == SourceKind::PhysicalDrive
-                                 ? "this mode needs a volume, not a whole disk"
-                                 : "this mode needs an NTFS volume";
-        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "Warning: %s", reason);
-        ImGui::Spacing();
+    if (needsVolume && !resolvedSource.empty()) {
+        bool ok = true;
+        const char* reason = nullptr;
+        if (ui.source == SourceKind::PhysicalDrive) {
+            ok = false;
+            reason = "this mode needs a volume, not a whole disk";
+        } else if (ui.source == SourceKind::Volume) {
+            if (ui.mode == Mode::MftRecover) {
+                ok = targetFileSystem == "NTFS";
+                reason = "this mode needs an NTFS volume";
+            } else if (ui.mode == Mode::FatRecover) {
+                ok = targetFileSystem.rfind("FAT", 0) == 0;
+                reason = "this mode needs a FAT12/16/32 volume (exFAT stores no names)";
+            }
+        }
+
+        if (!ok) {
+            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "Warning: %s", reason);
+            ImGui::Spacing();
+        }
     }
 
-    if (ui.mode == Mode::MftRecover && !targetRotational) {
+    if ((ui.mode == Mode::MftRecover || ui.mode == Mode::FatRecover) && !targetRotational) {
         ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f),
                            "Warning: target is a solid-state drive.");
         ImGui::TextWrapped("Deleted data on SSDs is usually erased by TRIM within seconds of "
@@ -739,6 +812,7 @@ void buildUi(UiState& ui, Job& job, Enumeration& enumeration) {
     }
 
     const bool recordBased = (ui.mode == Mode::MftRecover);
+    const bool clusterBased = (ui.mode == Mode::FatRecover);
 
     const double fraction = snapshot.bytesTotal == 0
                                 ? (finished ? 1.0 : 0.0)
@@ -747,6 +821,11 @@ void buildUi(UiState& ui, Job& job, Enumeration& enumeration) {
     char overlay[160];
     if (recordBased) {
         std::snprintf(overlay, sizeof(overlay), "%.1f%%  (%llu of %llu MFT records)",
+                      fraction * 100.0,
+                      static_cast<unsigned long long>(snapshot.bytesScanned),
+                      static_cast<unsigned long long>(snapshot.bytesTotal));
+    } else if (clusterBased) {
+        std::snprintf(overlay, sizeof(overlay), "%.1f%%  (%llu of %llu clusters)",
                       fraction * 100.0,
                       static_cast<unsigned long long>(snapshot.bytesScanned),
                       static_cast<unsigned long long>(snapshot.bytesTotal));

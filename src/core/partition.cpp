@@ -1,5 +1,7 @@
 #include "core/partition.h"
 
+#include "core/fat.h"
+
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -329,13 +331,32 @@ bool quickNtfsCheck(RawDevice& device, uint64_t offset) {
     return sector[0x1FE] == 0x55 && sector[0x1FF] == 0xAA;
 }
 
+bool quickFatCheck(RawDevice& device, uint64_t offset) {
+    uint8_t sector[512] = {};
+    if (!readAt(device, offset, sector, sizeof(sector))) {
+        return false;
+    }
+
+    FatVolumeInfo info;
+    std::string ignored;
+    return parseFatBootSector(sector, sizeof(sector), info, ignored) && info.kind != FatKind::None;
+}
+
 bool resolveNtfsBase(RawDevice& device,
                      const std::string& selection,
                      PartitionResolution& resolution,
-                     std::string& error) {
+                     std::string& error,
+                     bool acceptFat) {
     resolution = PartitionResolution{};
 
-    if (selection.empty() && quickNtfsCheck(device, 0)) {
+    const auto isVolume = [acceptFat](RawDevice& target, uint64_t offset) {
+        if (quickNtfsCheck(target, offset)) {
+            return true;
+        }
+        return acceptFat && quickFatCheck(target, offset);
+    };
+
+    if (selection.empty() && isVolume(device, 0)) {
         resolution.offset = 0;
         resolution.size = device.size();
         resolution.found = true;
@@ -366,15 +387,15 @@ bool resolveNtfsBase(RawDevice& device,
         return false;
     }
 
-    std::vector<PartitionInfo> ntfsPartitions;
+    std::vector<PartitionInfo> candidates;
     for (const auto& partition : partitions) {
-        if (partition.index != 0 && quickNtfsCheck(device, partition.offset)) {
-            ntfsPartitions.push_back(partition);
+        if (partition.index != 0 && isVolume(device, partition.offset)) {
+            candidates.push_back(partition);
         }
     }
 
-    if (ntfsPartitions.size() == 1) {
-        const PartitionInfo& only = ntfsPartitions.front();
+    if (candidates.size() == 1) {
+        const PartitionInfo& only = candidates.front();
         resolution.offset = only.offset;
         resolution.size = only.size;
         resolution.index = only.index;
@@ -385,13 +406,15 @@ bool resolveNtfsBase(RawDevice& device,
         return true;
     }
 
-    if (ntfsPartitions.size() > 1) {
-        error = "this input has " + std::to_string(ntfsPartitions.size()) +
-                " NTFS partitions; choose one with --partition";
+    if (candidates.size() > 1) {
+        error = "this input has " + std::to_string(candidates.size()) +
+                (acceptFat ? " candidate volumes; choose one with --partition"
+                           : " NTFS partitions; choose one with --partition");
         return false;
     }
 
-    error = "no NTFS partition found on this input";
+    error = acceptFat ? "no NTFS or FAT volume found on this input"
+                      : "no NTFS partition found on this input";
     if (partitions.empty()) {
         error += " (and no partition table; a bare volume has none, so point at the volume itself)";
     }

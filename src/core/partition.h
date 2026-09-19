@@ -23,6 +23,8 @@ std::vector<PartitionInfo> parsePartitions(RawDevice& device, std::string& error
 
 bool quickNtfsCheck(RawDevice& device, uint64_t offset);
 
+bool quickFatCheck(RawDevice& device, uint64_t offset);
+
 struct PartitionResolution {
     uint64_t offset = 0;
     uint64_t size = 0;
@@ -33,9 +35,13 @@ struct PartitionResolution {
     bool autoSelected = false;
 };
 
+// Works out the byte offset of the volume to use. When acceptFat is true a
+// FAT12/16/32 or exFAT boot sector is accepted as well as NTFS, so a whole-disk
+// image holding a FAT partition can be used by --free-only and --fat-recover.
 bool resolveNtfsBase(RawDevice& device,
                      const std::string& selection,
                      PartitionResolution& resolution,
-                     std::string& error);
+                     std::string& error,
+                     bool acceptFat = false);
 
 }
