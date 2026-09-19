@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace carver {
 
@@ -28,6 +29,7 @@ private:
     uint64_t size_ = 0;
     uint32_t sectorSize_ = 512;
     std::wstring path_;
+    std::vector<uint8_t> scratch_;
 };
 
 bool isElevated();

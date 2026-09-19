@@ -3,6 +3,8 @@
 #include <windows.h>
 #include <winioctl.h>
 
+#include <cstring>
+
 namespace carver {
 
 RawDevice::~RawDevice() {
@@ -17,6 +19,7 @@ void RawDevice::close() {
     size_ = 0;
     sectorSize_ = 512;
     path_.clear();
+    scratch_.clear();
 }
 
 bool RawDevice::isOpen() const {
@@ -85,8 +88,32 @@ bool RawDevice::readAt(uint64_t offset, void* buffer, uint32_t length, uint32_t&
         return true;
     }
 
+    // A volume or physical disk handle only accepts reads whose offset and length
+    // are multiples of the sector size, so round the request outward, read into a
+    // sector aligned buffer of our own, then copy back just the window asked for.
+    // Reading $Bitmap is what makes this matter: its size is ceil(clusters / 8),
+    // which is almost never a whole number of sectors.
+    const uint32_t sector = sectorSize_ != 0 ? sectorSize_ : 512u;
+    const uint64_t skip = offset % sector;
+    const uint64_t alignedStart = offset - skip;
+    const uint64_t alignedLength = ((skip + length + sector - 1) / sector) * sector;
+
+    if (alignedLength > 0xFFFFFFFFull) {
+        error = "read request is too large at offset " + std::to_string(offset);
+        return false;
+    }
+
+    const size_t needed = static_cast<size_t>(alignedLength) + sector;
+    if (scratch_.size() < needed) {
+        scratch_.resize(needed);
+    }
+
+    const uintptr_t rawAddress = reinterpret_cast<uintptr_t>(scratch_.data());
+    uint8_t* aligned = reinterpret_cast<uint8_t*>(
+        (rawAddress + sector - 1) & ~static_cast<uintptr_t>(sector - 1));
+
     LARGE_INTEGER position{};
-    position.QuadPart = static_cast<LONGLONG>(offset);
+    position.QuadPart = static_cast<LONGLONG>(alignedStart);
     if (!SetFilePointerEx(static_cast<HANDLE>(handle_), position, nullptr, FILE_BEGIN)) {
         error = "seek failed at offset " + std::to_string(offset) +
                 " (error " + std::to_string(GetLastError()) + ")";
@@ -94,13 +121,24 @@ bool RawDevice::readAt(uint64_t offset, void* buffer, uint32_t length, uint32_t&
     }
 
     DWORD read = 0;
-    if (!ReadFile(static_cast<HANDLE>(handle_), buffer, length, &read, nullptr)) {
+    if (!ReadFile(static_cast<HANDLE>(handle_), aligned, static_cast<DWORD>(alignedLength),
+                  &read, nullptr)) {
         error = "read failed at offset " + std::to_string(offset) +
                 " (error " + std::to_string(GetLastError()) + ")";
         return false;
     }
 
-    bytesRead = static_cast<uint32_t>(read);
+    if (static_cast<uint64_t>(read) <= skip) {
+        return true;
+    }
+
+    uint64_t available = static_cast<uint64_t>(read) - skip;
+    if (available > length) {
+        available = length;
+    }
+
+    std::memcpy(buffer, aligned + skip, static_cast<size_t>(available));
+    bytesRead = static_cast<uint32_t>(available);
     return true;
 }
 
