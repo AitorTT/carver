@@ -35,6 +35,7 @@ void printUsage() {
         "                    Applies to carving and to --mft-recover. In carve modes\n"
         "                    an extension matches a signature type, so skipping zip\n"
         "                    also skips epub, docx, apk and jar.\n"
+        "  --list-only       report each file and its size without writing anything\n"
         "  --free-only       scan only unallocated NTFS clusters, using $Bitmap\n"
         "                    (input must be an NTFS volume, e.g. \\\\.\\D:)\n"
         "  --mft-recover     recover deleted files by name from deleted $MFT records\n"
@@ -541,6 +542,7 @@ int main(int argc, char** argv) {
     carver::CarveOptions options;
     bool freeOnly = false;
     bool mftRecover = false;
+    bool listOnly = false;
     std::string partitionSelection;
     std::vector<std::string> skipExtensions;
 
@@ -552,6 +554,10 @@ int main(int argc, char** argv) {
         }
         if (flag == "--mft-recover") {
             mftRecover = true;
+            continue;
+        }
+        if (flag == "--list-only") {
+            listOnly = true;
             continue;
         }
         if (index + 1 >= args.size()) {
@@ -575,6 +581,7 @@ int main(int argc, char** argv) {
     }
 
     options.skipExtensions = skipExtensions;
+    options.listOnly = listOnly;
 
     const std::string inputPath = args[0];
     const std::string outputDirectory = args[1];
@@ -723,7 +730,18 @@ int main(int argc, char** argv) {
         }
         std::cout << "\n";
 
-        const auto recoverProgress = [](const carver::Progress& state) {
+        uint64_t listed = 0;
+        const auto recoverProgress = [listOnly, &listed](const carver::Progress& state) {
+            if (listOnly) {
+                if (state.filesRecovered > listed && !state.currentOutput.empty()) {
+                    listed = state.filesRecovered;
+                    std::printf("  %-44s %10s\n", state.currentOutput.c_str(),
+                                humanBytes(state.currentSize).c_str());
+                    std::fflush(stdout);
+                }
+                return true;
+            }
+
             const double percent = state.bytesTotal == 0
                                         ? 100.0
                                         : (static_cast<double>(state.bytesScanned) /
@@ -740,6 +758,7 @@ int main(int argc, char** argv) {
 
         carver::RecoverOptions recoverOptions;
         recoverOptions.skipExtensions = skipExtensions;
+        recoverOptions.listOnly = listOnly;
         std::vector<carver::RecoveredFile> index;
 
         const carver::RecoverResult recovered = carver::recoverDeletedFiles(
@@ -753,8 +772,10 @@ int main(int argc, char** argv) {
 
         std::cout << "records scanned : " << recovered.recordsScanned << "\n";
         std::cout << "deleted entries : " << recovered.deletedFound << "\n";
-        std::cout << "files written   : " << recovered.filesWritten << "\n";
-        std::cout << "bytes written   : " << humanBytes(recovered.bytesWritten) << "\n";
+        std::cout << (listOnly ? "files listed    : " : "files written   : ")
+                  << recovered.filesWritten << "\n";
+        std::cout << (listOnly ? "bytes listed    : " : "bytes written   : ")
+                  << humanBytes(recovered.bytesWritten) << "\n";
         std::cout << "possibly overwritten : " << recovered.atRisk << "\n";
         std::cout << "index           : " << outputDirectory << "\\recovered.csv\n";
         if (recovered.cancelled) {
@@ -812,7 +833,18 @@ int main(int argc, char** argv) {
 
     const auto& signatures = carver::defaultSignatures();
 
-    const auto progress = [](const carver::Progress& state) {
+    uint64_t listed = 0;
+    const auto progress = [listOnly, &listed](const carver::Progress& state) {
+        if (listOnly) {
+            if (state.filesRecovered > listed && !state.currentOutput.empty()) {
+                listed = state.filesRecovered;
+                std::printf("  %-44s %10s\n", state.currentOutput.c_str(),
+                            humanBytes(state.currentSize).c_str());
+                std::fflush(stdout);
+            }
+            return true;
+        }
+
         const double percent = state.bytesTotal == 0
                                     ? 100.0
                                     : (static_cast<double>(state.bytesScanned) /
@@ -837,8 +869,10 @@ int main(int argc, char** argv) {
         std::cerr << "error: " << error << "\n";
     }
 
-    std::cout << "files recovered : " << result.filesRecovered << "\n";
-    std::cout << "bytes recovered : " << humanBytes(result.bytesRecovered) << "\n";
+    std::cout << (listOnly ? "files listed    : " : "files recovered : ")
+              << result.filesRecovered << "\n";
+    std::cout << (listOnly ? "bytes listed    : " : "bytes recovered : ")
+              << humanBytes(result.bytesRecovered) << "\n";
     std::cout << "bytes scanned   : " << humanBytes(result.bytesScanned) << "\n";
     if (result.cancelled) {
         std::cout << "cancelled\n";

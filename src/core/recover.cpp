@@ -364,7 +364,18 @@ RecoverResult recoverDeletedFiles(RawDevice& device,
                 const std::wstring outputPath = outputRoot + L"\\" + utf8ToWide(recovered.outputName);
 
                 uint64_t written = 0;
-                if (writeEntryData(device, info, entry, outputPath, written, error) && written > 0) {
+                bool haveEntry = false;
+                if (options.listOnly) {
+                    // Nothing is written, so the size has to come from the record.
+                    // For a compressed attribute this is the decompressed length,
+                    // which is what would be produced on disk.
+                    written = entry.logicalSize;
+                    haveEntry = written > 0;
+                } else {
+                    haveEntry = writeEntryData(device, info, entry, outputPath, written, error) && written > 0;
+                }
+
+                if (haveEntry) {
                     recovered.size = written;
                     result.filesWritten += 1;
                     result.bytesWritten += written;
@@ -379,6 +390,7 @@ RecoverResult recoverDeletedFiles(RawDevice& device,
         state.filesRecovered = result.filesWritten;
         state.bytesRecovered = result.bytesWritten;
         state.currentOutput = index.empty() ? std::string() : index.back().outputName;
+        state.currentSize = index.empty() ? 0 : index.back().size;
 
         if (progress && !progress(state)) {
             result.cancelled = true;

@@ -431,6 +431,48 @@ if ($skipOutput -match 'skipping\s*:\s*\.png, \.jpg') {
     $failures += 'skip-report'
 }
 
+# 10. --list-only lists the same entries and sizes but copies no data
+Write-Host ''
+Write-Host '=== running --mft-recover with --list-only ==='
+
+$listDir = Join-Path $WorkDir 'recovered_list'
+if (Test-Path -LiteralPath $listDir) { Remove-Item -LiteralPath $listDir -Recurse -Force }
+
+$previous = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try { $listOutput = & $CarverExe $imagePath $listDir --mft-recover --list-only 2>&1 | Out-String }
+finally { $ErrorActionPreference = $previous }
+
+$listData = @(Get-ChildItem -LiteralPath $listDir -File -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -ne 'recovered.csv' })
+if ($listData.Count -eq 0) {
+    Write-Host '  [ok]   no data was written, only the index'
+} else {
+    Write-Host ("  [FAIL] --list-only wrote {0} data file(s)" -f $listData.Count)
+    $failures += 'list-wrote'
+}
+
+$listCsv = Join-Path $listDir 'recovered.csv'
+if (Test-Path -LiteralPath $listCsv) {
+    $listNames = @(Import-Csv -LiteralPath $listCsv | ForEach-Object { $_.original_name })
+    if ($listNames.Count -eq $rows.Count) {
+        Write-Host ("  [ok]   the index still lists all {0} files" -f $listNames.Count)
+    } else {
+        Write-Host ("  [FAIL] the index lists {0} of {1} files" -f $listNames.Count, $rows.Count)
+        $failures += 'list-index'
+    }
+} else {
+    Write-Host '  [FAIL] --list-only wrote no index'
+    $failures += 'list-index'
+}
+
+if ($listOutput -match 'files listed\s+:\s+3') {
+    Write-Host '  [ok]   reported 3 files listed'
+} else {
+    Write-Host '  [FAIL] the listed file count did not match 3'
+    $failures += 'list-count'
+}
+
 Write-Host ''
 if ($failures.Count -gt 0) {
     Write-Host ("FAILED: {0}" -f ($failures -join ', '))

@@ -44,13 +44,17 @@ uint64_t carveOne(RawDevice& device,
                   const Signature& signature,
                   uint64_t declaredSize,
                   const std::wstring& outputPath,
+                  bool writeToDisk,
                   uint64_t& bytesWritten) {
     bytesWritten = 0;
 
-    HANDLE output = CreateFileW(outputPath.c_str(), GENERIC_WRITE, 0, nullptr,
-                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (output == INVALID_HANDLE_VALUE) {
-        return startOffset + 1;
+    HANDLE output = INVALID_HANDLE_VALUE;
+    if (writeToDisk) {
+        output = CreateFileW(outputPath.c_str(), GENERIC_WRITE, 0, nullptr,
+                             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (output == INVALID_HANDLE_VALUE) {
+            return startOffset + 1;
+        }
     }
 
     const bool exactLength = declaredSize > 0;
@@ -108,8 +112,12 @@ uint64_t carveOne(RawDevice& device,
         }
 
         DWORD written = 0;
-        if (!WriteFile(output, buffer.data(), writeLength, &written, nullptr)) {
-            break;
+        if (writeToDisk) {
+            if (!WriteFile(output, buffer.data(), writeLength, &written, nullptr)) {
+                break;
+            }
+        } else {
+            written = writeLength;
         }
         bytesWritten += written;
 
@@ -125,10 +133,14 @@ uint64_t carveOne(RawDevice& device,
         }
     }
 
-    CloseHandle(output);
+    if (writeToDisk) {
+        CloseHandle(output);
+    }
 
     if (bytesWritten == 0) {
-        DeleteFileW(outputPath.c_str());
+        if (writeToDisk) {
+            DeleteFileW(outputPath.c_str());
+        }
     } else if (endOffset <= startOffset) {
         endOffset = position;
     }
@@ -283,14 +295,17 @@ CarveResult carveDevice(RawDevice& device,
                 const std::wstring outputPath = outputRoot + L"\\" + utf8ToWide(baseName);
 
                 uint64_t written = 0;
-                const uint64_t endOffset = carveOne(device, carveStart, rangeEnd, *found, declared, outputPath, written);
+                const uint64_t endOffset = carveOne(device, carveStart, rangeEnd, *found, declared,
+                                                    outputPath, !options.listOnly, written);
 
                 if (written > 0) {
                     result.filesRecovered += 1;
                     result.bytesRecovered += written;
                     state.currentOutput = baseName;
+                    state.currentSize = written;
                 } else {
                     state.currentOutput.clear();
+                    state.currentSize = 0;
                 }
 
                 state.currentType = found->name;

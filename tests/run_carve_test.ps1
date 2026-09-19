@@ -350,6 +350,45 @@ if ($skipOutput -match 'skipping\s*:\s*\.jpg, \.png') {
     $failures += 'skip-report'
 }
 
+# --list-only must report every name with its size and copy nothing at all.
+Write-Host ''
+Write-Host '=== carving again, listing only ==='
+
+$listDir = Join-Path $WorkDir 'recovered_list'
+if (Test-Path -LiteralPath $listDir) { Remove-Item -LiteralPath $listDir -Recurse -Force }
+
+$previous = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try { $listOutput = & $CarverExe $imagePath $listDir --chunk $ChunkSize --list-only 2>&1 | Out-String }
+finally { $ErrorActionPreference = $previous }
+if ($LASTEXITCODE -ne 0) { throw "carver-cli exited with $LASTEXITCODE" }
+
+$listedFiles = @(Get-ChildItem -LiteralPath $listDir -File -ErrorAction SilentlyContinue)
+if ($listedFiles.Count -eq 0) {
+    Write-Host '  [ok]   no data was written'
+} else {
+    Write-Host ("  [FAIL] --list-only wrote {0} file(s)" -f $listedFiles.Count)
+    $failures += 'list-wrote'
+}
+
+$missing = @()
+foreach ($file in $recovered) {
+    if ($listOutput -notmatch [regex]::Escape($file.Name)) { $missing += $file.Name }
+}
+if ($missing.Count -eq 0) {
+    Write-Host ("  [ok]   all {0} file names appear in the listing" -f $recovered.Count)
+} else {
+    Write-Host ("  [FAIL] missing from the listing: {0}" -f ($missing -join ', '))
+    $failures += 'list-names'
+}
+
+if ($listOutput -match ('files listed\s+:\s+' + $recovered.Count)) {
+    Write-Host ("  [ok]   reported {0} files listed" -f $recovered.Count)
+} else {
+    Write-Host '  [FAIL] the listed file count was wrong'
+    $failures += 'list-count'
+}
+
 Write-Host ''
 if ($failures.Count -gt 0) {
     Write-Host ("FAILED: {0}" -f ($failures -join ', '))

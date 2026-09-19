@@ -282,7 +282,8 @@ void runJob(Job& job,
             const std::string& sourcePath,
             const std::string& outputDirectory,
             Mode mode,
-            const std::string& skipExtensionText) {
+            const std::string& skipExtensionText,
+            bool listOnly) {
     const std::vector<std::string> skipExtensions = carver::parseExtensionList(skipExtensionText);
 
     job.running = true;
@@ -314,6 +315,7 @@ void runJob(Job& job,
 
     const auto onProgress = [&job](const carver::Progress& state) {
         std::string recoveredName;
+        uint64_t recoveredSize = 0;
         {
             std::lock_guard<std::mutex> lock(job.mutex);
             job.progress = state;
@@ -324,11 +326,12 @@ void runJob(Job& job,
             if (state.filesRecovered > job.loggedFiles && !state.currentOutput.empty()) {
                 job.loggedFiles = state.filesRecovered;
                 recoveredName = state.currentOutput;
+                recoveredSize = state.currentSize;
             }
         }
 
         if (!recoveredName.empty()) {
-            job.addLine("  " + recoveredName);
+            job.addLine("  " + recoveredName + "  (" + humanBytes(recoveredSize) + ")");
         }
 
         return !job.cancel.load();
@@ -355,6 +358,7 @@ void runJob(Job& job,
 
             carver::RecoverOptions options;
             options.skipExtensions = skipExtensions;
+            options.listOnly = listOnly;
             std::vector<carver::RecoveredFile> index;
 
             const carver::RecoverResult result = carver::recoverDeletedFiles(
@@ -377,6 +381,7 @@ void runJob(Job& job,
     } else {
         carver::CarveOptions options;
         options.skipExtensions = skipExtensions;
+        options.listOnly = listOnly;
 
         if (mode == Mode::CarveFree) {
             carver::NtfsVolumeInfo volume;
@@ -421,7 +426,9 @@ void runJob(Job& job,
     } else if (!job.error.empty()) {
         job.addLine("error: " + job.error);
     } else {
-        job.addLine("done: " + std::to_string(job.filesWritten) + " files, " + humanBytes(job.bytesWritten));
+        job.addLine((listOnly ? "listed: " : "done: ") + std::to_string(job.filesWritten) +
+                    " files, " + humanBytes(job.bytesWritten) +
+                    (listOnly ? "  (nothing was written)" : ""));
     }
 
     job.running = false;
@@ -436,6 +443,7 @@ struct UiState {
     char imagePath[512] = {};
     char outputPath[512] = {};
     char skipExtensions[256] = {};
+    bool listOnly = true;
     std::vector<carver::DriveInfo> drives;
     std::vector<carver::VolumeInfo> volumes;
     bool selectionInitialised = false;
@@ -551,6 +559,16 @@ void buildUi(UiState& ui, Job& job, Enumeration& enumeration) {
     }
     ImGui::EndDisabled();
 
+    if (ui.outputPath[0] != '\0') {
+        const std::string outputMount = carver::mountPointOfPath(ui.outputPath);
+        uint64_t freeBytes = 0;
+        uint64_t totalBytes = 0;
+        if (!outputMount.empty() && carver::volumeFreeSpace(outputMount, freeBytes, totalBytes)) {
+            ImGui::TextDisabled("free space: %s of %s on %s", humanBytes(freeBytes).c_str(),
+                                humanBytes(totalBytes).c_str(), outputMount.c_str());
+        }
+    }
+
     ImGui::Spacing();
     ImGui::TextUnformatted("Mode");
     ImGui::Separator();
@@ -578,9 +596,21 @@ void buildUi(UiState& ui, Job& job, Enumeration& enumeration) {
                           "MFT mode matches the original file name, so '.epub' really\n"
                           "skips EPUB books. Carving only sees headers, and EPUB, DOCX,\n"
                           "APK and JAR all share the zip signature, so carving cannot\n"
-                          "tell them apart from a zip.");
+                           "tell them apart from a zip.");
     }
     ImGui::EndDisabled();
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+    ImGui::BeginDisabled(busy);
+    ImGui::Checkbox("List only, do not write any files", &ui.listOnly);
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Logs every file name and size, and still writes recovered.csv,\n"
+                          "but copies no data. Handy for sizing up a drive before spending\n"
+                          "the disk space. On by default.");
+    }
 
     ImGui::Spacing();
     ImGui::Separator();
@@ -662,8 +692,9 @@ void buildUi(UiState& ui, Job& job, Enumeration& enumeration) {
             const std::string output = ui.outputPath;
             const std::string skip = ui.skipExtensions;
             const Mode mode = ui.mode;
-            job.worker = std::thread([&job, source, output, mode, skip] {
-                runJob(job, source, output, mode, skip);
+            const bool listOnly = ui.listOnly;
+            job.worker = std::thread([&job, source, output, mode, skip, listOnly] {
+                runJob(job, source, output, mode, skip, listOnly);
             });
         }
         ImGui::EndDisabled();

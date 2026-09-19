@@ -16,6 +16,7 @@ struct Progress {
     uint64_t bytesTotal = 0;
     uint64_t filesRecovered = 0;
     uint64_t bytesRecovered = 0;
+    uint64_t currentSize = 0;
     std::string currentType;
     std::string currentOutput;
 };
@@ -28,6 +29,7 @@ struct CarveOptions {
     uint64_t chunkSize = 8ull * 1024ull * 1024ull;
     std::vector<ByteRange> ranges;
     std::vector<std::string> skipExtensions;
+    bool listOnly = false;
 };
 
 struct CarveResult {
