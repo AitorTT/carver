@@ -28,6 +28,9 @@ using ImageProgressFn = std::function<bool(const ImageProgress&)>;
 struct ImageResult {
     uint64_t bytesWritten = 0;
     uint64_t bytesThisRun = 0;
+    uint64_t badSectors = 0;       // unreadable sectors replaced with zeros
+    uint64_t bytesZeroed = 0;      // how many bytes that added up to
+    uint64_t firstBadOffset = 0;   // where the first unreadable sector was found
     std::string sha256;
     bool cancelled = false;
     bool resumed = false;

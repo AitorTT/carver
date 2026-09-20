@@ -91,6 +91,8 @@ struct Job {
     uint64_t recordsScanned = 0;
     uint64_t deletedFound = 0;
     uint64_t loggedFiles = 0;
+    uint64_t readErrors = 0;
+    uint64_t loggedReadErrors = 0;
 
     void addLine(const std::string& line) {
         std::lock_guard<std::mutex> lock(mutex);
@@ -286,7 +288,8 @@ void runJob(Job& job,
             Mode mode,
             const std::string& skipExtensionText,
             const std::string& onlyExtensionText,
-            bool listOnly) {
+            bool listOnly,
+            bool resume) {
     const std::vector<std::string> skipExtensions = carver::parseExtensionList(skipExtensionText);
     const std::vector<std::string> onlyExtensions = carver::parseExtensionList(onlyExtensionText);
 
@@ -300,6 +303,8 @@ void runJob(Job& job,
     job.recordsScanned = 0;
     job.deletedFound = 0;
     job.loggedFiles = 0;
+    job.readErrors = 0;
+    job.loggedReadErrors = 0;
 
     carver::RawDevice device;
     std::string error;
@@ -320,6 +325,8 @@ void runJob(Job& job,
     const auto onProgress = [&job](const carver::Progress& state) {
         std::string recoveredName;
         uint64_t recoveredSize = 0;
+        bool badSector = false;
+        uint64_t badOffset = 0;
         {
             std::lock_guard<std::mutex> lock(job.mutex);
             job.progress = state;
@@ -332,10 +339,20 @@ void runJob(Job& job,
                 recoveredName = state.currentOutput;
                 recoveredSize = state.currentSize;
             }
+
+            if (state.readErrors > job.loggedReadErrors) {
+                job.loggedReadErrors = state.readErrors;
+                badSector = true;
+                badOffset = state.lastBadOffset;
+            }
         }
 
         if (!recoveredName.empty()) {
             job.addLine("  " + recoveredName + "  (" + humanBytes(recoveredSize) + ")");
+        }
+
+        if (badSector) {
+            job.addLine("unreadable sector at offset " + std::to_string(badOffset) + ", skipping");
         }
 
         return !job.cancel.load();
@@ -428,6 +445,7 @@ void runJob(Job& job,
         options.skipExtensions = skipExtensions;
         options.onlyExtensions = onlyExtensions;
         options.listOnly = listOnly;
+        options.resume = resume;
 
         if (mode == Mode::CarveFree) {
             carver::NtfsVolumeInfo volume;
@@ -478,11 +496,21 @@ void runJob(Job& job,
             }
             job.filesWritten = result.filesRecovered;
             job.bytesWritten = result.bytesRecovered;
+            job.readErrors = result.readErrors;
+            if (result.readErrors > 0) {
+                job.addLine("unreadable sectors: " + std::to_string(result.readErrors) + " (" +
+                            humanBytes(result.bytesSkipped) + " skipped), first at offset " +
+                            std::to_string(result.firstBadOffset));
+            }
         }
     }
 
     if (job.cancel.load()) {
-        job.addLine("cancelled");
+        if (mode == Mode::CarveWhole || mode == Mode::CarveFree) {
+            job.addLine("cancelled; checkpoint saved, tick Resume to continue");
+        } else {
+            job.addLine("cancelled");
+        }
     } else if (!job.error.empty()) {
         job.addLine("error: " + job.error);
     } else {
@@ -505,6 +533,7 @@ struct UiState {
     char skipExtensions[256] = {};
     char onlyExtensions[256] = {};
     bool listOnly = true;
+    bool resume = false;
     std::vector<carver::DriveInfo> drives;
     std::vector<carver::VolumeInfo> volumes;
     bool selectionInitialised = false;
@@ -688,6 +717,16 @@ void buildUi(UiState& ui, Job& job, Enumeration& enumeration) {
                           "the disk space. On by default.");
     }
 
+    if (ui.mode == Mode::CarveWhole || ui.mode == Mode::CarveFree) {
+        ImGui::BeginDisabled(busy);
+        ImGui::Checkbox("Resume a paused scan", &ui.resume);
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Carries on from the checkpoint saved in the output folder when a\n"
+                              "scan is stopped with Stop. Leave off to start the scan over.");
+        }
+    }
+
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
@@ -784,8 +823,9 @@ void buildUi(UiState& ui, Job& job, Enumeration& enumeration) {
             const std::string only = ui.onlyExtensions;
             const Mode mode = ui.mode;
             const bool listOnly = ui.listOnly;
-            job.worker = std::thread([&job, source, output, mode, skip, only, listOnly] {
-                runJob(job, source, output, mode, skip, only, listOnly);
+            const bool resume = ui.resume;
+            job.worker = std::thread([&job, source, output, mode, skip, only, listOnly, resume] {
+                runJob(job, source, output, mode, skip, only, listOnly, resume);
             });
         }
         ImGui::EndDisabled();

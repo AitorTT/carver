@@ -11,7 +11,10 @@
 #include "core/recover.h"
 #include "core/signature.h"
 
+#include <windows.h>
+
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
@@ -19,6 +22,17 @@
 #include <vector>
 
 namespace {
+
+std::atomic<bool> g_interrupted{false};
+
+BOOL WINAPI consoleHandler(DWORD type) {
+    if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT) {
+        // First press pauses the scan so it can be resumed; a second press lets
+        // the default handler run and terminates the process.
+        return g_interrupted.exchange(true) ? FALSE : TRUE;
+    }
+    return FALSE;
+}
 
 void printUsage() {
     std::cout <<
@@ -32,6 +46,10 @@ void printUsage() {
         "  --start <bytes>   first byte to scan (default 0)\n"
         "  --end <bytes>     last byte to scan (default end of input)\n"
         "  --chunk <bytes>   read chunk size (default 8 MiB)\n"
+        "  --resume          carry on a scan that was paused with Ctrl+C or stopped\n"
+        "                    early, using the checkpoint left in the output folder\n"
+        "  --resume-from <bytes>   carry on from a chosen offset instead of the\n"
+        "                    checkpoint (the output folder is still reused)\n"
         "  --skip-ext <list> skip these extensions, comma separated, e.g. epub,pdf.\n"
         "                    Applies to carving and to --mft-recover. In carve modes\n"
         "                    an extension matches a signature type, so skipping zip\n"
@@ -120,6 +138,8 @@ void printDrives() {
 
 int main(int argc, char** argv) {
     const std::vector<std::string> args(argv + 1, argv + argc);
+
+    SetConsoleCtrlHandler(consoleHandler, TRUE);
 
     if (args.empty()) {
         printUsage();
@@ -282,6 +302,11 @@ int main(int argc, char** argv) {
         }
         std::cout << "\n";
         std::cout << "sha256        : " << imageResult.sha256 << "\n";
+        if (imageResult.badSectors > 0) {
+            std::cout << "bad sectors   : " << imageResult.badSectors << " ("
+                      << humanBytes(imageResult.bytesZeroed) << " zero-filled, first at offset "
+                      << imageResult.firstBadOffset << ")\n";
+        }
         std::cout << "\nverify with   : certutil -hashfile \"" << destinationPath << "\" SHA256\n";
         return 0;
     }
@@ -574,6 +599,10 @@ int main(int argc, char** argv) {
             listOnly = true;
             continue;
         }
+        if (flag == "--resume") {
+            options.resume = true;
+            continue;
+        }
         if (index + 1 >= args.size()) {
             std::cerr << "error: " << flag << " requires a value\n";
             return 1;
@@ -586,6 +615,9 @@ int main(int argc, char** argv) {
             options.chunkSize = std::strtoull(args[++index].c_str(), nullptr, 0);
         } else if (flag == "--partition") {
             partitionSelection = args[++index];
+        } else if (flag == "--resume-from") {
+            options.resumeOffset = std::strtoull(args[++index].c_str(), nullptr, 0);
+            options.hasResumeOffset = true;
         } else if (flag == "--skip-ext") {
             skipExtensions = carver::parseExtensionList(args[++index]);
         } else if (flag == "--only-ext") {
@@ -594,6 +626,11 @@ int main(int argc, char** argv) {
             std::cerr << "error: unknown option " << flag << "\n";
             return 1;
         }
+    }
+
+    if (options.resume && options.hasResumeOffset) {
+        std::cerr << "error: choose either --resume or --resume-from, not both\n";
+        return 1;
     }
 
     options.skipExtensions = skipExtensions;
@@ -921,8 +958,15 @@ int main(int argc, char** argv) {
 
     const auto& signatures = carver::defaultSignatures();
 
+    const uint64_t carveStopAfter = [] {
+        const char* value = std::getenv("CARVER_CARVE_STOP_AFTER");
+        return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull;
+    }();
+
     uint64_t listed = 0;
-    const auto progress = [listOnly, &listed](const carver::Progress& state) {
+    const auto progress = [listOnly, &listed, carveStopAfter](const carver::Progress& state) {
+        const bool carryOn = !g_interrupted.load() &&
+                             (carveStopAfter == 0 || state.bytesScanned < carveStopAfter);
         if (listOnly) {
             if (state.filesRecovered > listed && !state.currentOutput.empty()) {
                 listed = state.filesRecovered;
@@ -930,7 +974,7 @@ int main(int argc, char** argv) {
                             humanBytes(state.currentSize).c_str());
                 std::fflush(stdout);
             }
-            return true;
+            return carryOn;
         }
 
         const double percent = state.bytesTotal == 0
@@ -945,7 +989,7 @@ int main(int argc, char** argv) {
                     humanBytes(state.bytesRecovered).c_str(),
                     state.currentOutput.c_str());
         std::fflush(stdout);
-        return true;
+        return carryOn;
     };
 
     const carver::CarveResult result =
@@ -957,12 +1001,24 @@ int main(int argc, char** argv) {
         std::cerr << "error: " << error << "\n";
     }
 
+    if (result.resumedFrom > 0) {
+        std::cout << "resumed from    : " << humanBytes(result.resumedFrom) << "\n";
+    }
     std::cout << (listOnly ? "files listed    : " : "files recovered : ")
               << result.filesRecovered << "\n";
     std::cout << (listOnly ? "bytes listed    : " : "bytes recovered : ")
               << humanBytes(result.bytesRecovered) << "\n";
     std::cout << "bytes scanned   : " << humanBytes(result.bytesScanned) << "\n";
-    if (result.cancelled) {
+    if (result.readErrors > 0) {
+        std::cout << "unreadable      : " << result.readErrors << " sector(s) ("
+                  << humanBytes(result.bytesSkipped) << " skipped), first at offset "
+                  << result.firstBadOffset << "\n";
+    }
+    if (result.paused) {
+        std::cout << "paused          : checkpoint saved in " << outputDirectory << "\n";
+        std::cout << "resume with     : carver-cli \"" << inputPath << "\" \"" << outputDirectory
+                  << "\" --resume\n";
+    } else if (result.cancelled) {
         std::cout << "cancelled\n";
     }
 

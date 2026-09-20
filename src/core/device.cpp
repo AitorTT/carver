@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <winioctl.h>
 
+#include <cstdlib>
 #include <cstring>
 
 namespace carver {
@@ -106,6 +107,22 @@ bool RawDevice::readAt(uint64_t offset, void* buffer, uint32_t length, uint32_t&
     const size_t needed = static_cast<size_t>(alignedLength) + sector;
     if (scratch_.size() < needed) {
         scratch_.resize(needed);
+    }
+
+    // Test hook: CARVER_FAULT_AT and CARVER_FAULT_LEN describe a region that
+    // always fails to read, so damaged-sector handling can be exercised on a
+    // plain image file without real failing hardware. Off unless both are set.
+    static const uint64_t faultAt = [] {
+        const char* value = std::getenv("CARVER_FAULT_AT");
+        return value != nullptr ? std::strtoull(value, nullptr, 0) : 0ull;
+    }();
+    static const uint64_t faultLength = [] {
+        const char* value = std::getenv("CARVER_FAULT_LEN");
+        return value != nullptr ? std::strtoull(value, nullptr, 0) : 0ull;
+    }();
+    if (faultLength > 0 && alignedStart < faultAt + faultLength && faultAt < alignedStart + alignedLength) {
+        error = "read failed at offset " + std::to_string(offset) + " (simulated bad sector)";
+        return false;
     }
 
     const uintptr_t rawAddress = reinterpret_cast<uintptr_t>(scratch_.data());

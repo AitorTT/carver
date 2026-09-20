@@ -372,30 +372,76 @@ bool createImage(RawDevice& source,
     bool ok = true;
     bool cancelled = false;
 
-    while (position < end) {
-        const uint32_t want = static_cast<uint32_t>(std::min<uint64_t>(buffer.size(), end - position));
-        uint32_t got = 0;
-        if (!source.readAt(position, buffer.data(), want, got, error) || got == 0) {
-            if (error.empty()) {
-                error = "source returned no data at offset " + std::to_string(position);
-            }
-            ok = false;
-            break;
-        }
+    const uint32_t sourceSector = source.sectorSize() != 0 ? source.sectorSize() : 512u;
+    uint64_t sectorModeEnd = 0;
 
+    // Writes `length` bytes at the current position and folds them into the
+    // image hash. Returns false only when the write or the hasher fails.
+    const auto emit = [&](const uint8_t* data, uint32_t length) -> bool {
         DWORD produced = 0;
-        if (!WriteFile(destination, buffer.data(), got, &produced, nullptr) || produced != got) {
+        if (!WriteFile(destination, data, length, &produced, nullptr) || produced != length) {
             error = "cannot write to " + destinationPath + " (error " + std::to_string(GetLastError()) + ")";
-            ok = false;
+            return false;
+        }
+        if (!hasher.update(data, length, error)) {
+            return false;
+        }
+        return true;
+    };
+
+    while (position < end) {
+        uint64_t want = std::min<uint64_t>(buffer.size(), end - position);
+        if (position < sectorModeEnd && want > sourceSector) {
+            want = sourceSector;
+        }
+
+        uint32_t got = 0;
+        std::string readError;
+        bool readable = source.readAt(position, buffer.data(), static_cast<uint32_t>(want), got, readError);
+
+        if (readable && got == 0) {
+            // Nothing more to read; stop instead of zero filling the tail.
             break;
         }
 
-        if (!hasher.update(buffer.data(), got, error)) {
-            ok = false;
-            break;
+        if (!readable && want > sourceSector) {
+            // A damaged sector made the whole read fail. Note the window and
+            // fall back to single sectors so the good ones still land.
+            if (sectorModeEnd < position + want) {
+                sectorModeEnd = std::min<uint64_t>(end, position + want);
+            }
+            const uint32_t step = static_cast<uint32_t>(std::min<uint64_t>(sourceSector, end - position));
+            uint32_t one = 0;
+            std::string sectorError;
+            readable = source.readAt(position, buffer.data(), step, one, sectorError) && one > 0;
+            got = one;
         }
 
-        position += got;
+        uint32_t produced = 0;
+        if (!readable) {
+            // Substitute zeros for the unreadable sector so the image keeps its
+            // length and every later byte stays at its original offset.
+            const uint32_t step = static_cast<uint32_t>(std::min<uint64_t>(sourceSector, end - position));
+            std::fill(buffer.begin(), buffer.begin() + step, 0);
+            if (!emit(buffer.data(), step)) {
+                ok = false;
+                break;
+            }
+            produced = step;
+            result.badSectors += 1;
+            result.bytesZeroed += step;
+            if (result.badSectors == 1) {
+                result.firstBadOffset = position;
+            }
+        } else {
+            if (!emit(buffer.data(), got)) {
+                ok = false;
+                break;
+            }
+            produced = got;
+        }
+
+        position += produced;
         written += produced;
         sinceCheckpoint += produced;
 
